@@ -162,50 +162,80 @@ def initialize_sam3_model():
 
         sam3_loaded = False
 
-        # Method 1: Try build_sam3_image_model (official SAM3 API pattern)
-        try:
-            from sam3 import build_sam3_image_model, SAM3ImagePredictor
-            print("Loading SAM 3 model via build_sam3_image_model...")
-
-            # Check for local checkpoint first
-            checkpoint_path = "./sam3/checkpoints/sam3_hiera_large.pt"
-            if os.path.exists(checkpoint_path):
-                sam3_model = build_sam3_image_model(checkpoint=checkpoint_path)
-                print(f"✓ SAM 3 loaded from local checkpoint: {checkpoint_path}")
-            else:
-                # Try without explicit checkpoint (uses default)
-                sam3_model = build_sam3_image_model()
-                print("✓ SAM 3 loaded with default checkpoint")
-
-            sam3_model = sam3_model.to(device)
-            sam3_model.eval()
-
-            # Create predictor wrapper
-            sam3_processor = SAM3ImagePredictor(sam3_model)
-            sam3_loaded = True
-            print("✓ SAM 3 model and predictor initialized successfully")
-        except ImportError as e1:
-            print(f"⚠ SAM 3 build_sam3_image_model not available: {e1}")
-        except Exception as e1:
-            print(f"⚠ SAM 3 build_sam3_image_model failed: {e1}")
-
-        # Method 2: Try SAM3 predictor directly
+        # Method 1: Use sam3.sam3.build_sam3_image_model (CORRECT import path)
         if not sam3_loaded:
             try:
-                from sam3.build_sam3 import build_sam3
-                from sam3.sam3_image_predictor import SAM3ImagePredictor as Sam3Predictor
-                print("Loading SAM 3 via build_sam3...")
+                from sam3.sam3 import build_sam3_image_model
+                print("Loading SAM 3 via sam3.sam3.build_sam3_image_model...")
 
-                sam3_model = build_sam3("sam3_hiera_large")
+                # Check for local checkpoint
+                checkpoint_paths = [
+                    "./sam3/checkpoints/sam3_hiera_large.pt",
+                    "./sam3/checkpoints/sam3.pt",
+                    "./sam3/checkpoints/sam3_hiera_base_plus.pt",
+                ]
+                checkpoint_path = None
+                for cp in checkpoint_paths:
+                    if os.path.exists(cp):
+                        checkpoint_path = cp
+                        break
+
+                if checkpoint_path:
+                    print(f"  Using checkpoint: {checkpoint_path}")
+                    sam3_model = build_sam3_image_model(checkpoint=checkpoint_path)
+                else:
+                    print("  No local checkpoint found, using default...")
+                    sam3_model = build_sam3_image_model()
+
                 sam3_model = sam3_model.to(device)
                 sam3_model.eval()
-                sam3_processor = Sam3Predictor(sam3_model)
+
+                # Try to get SAM3ImagePredictor
+                try:
+                    from sam3.sam3.sam3_image_predictor import SAM3ImagePredictor
+                    sam3_processor = SAM3ImagePredictor(sam3_model)
+                    print("✓ SAM 3 ImagePredictor initialized")
+                except ImportError:
+                    # Model might be usable directly or need different predictor
+                    sam3_processor = sam3_model
+                    print("✓ SAM 3 model initialized (no separate predictor)")
+
                 sam3_loaded = True
-                print("✓ SAM 3 model initialized via build_sam3")
+                print("✓ SAM 3 model loaded successfully via build_sam3_image_model")
+            except ImportError as e1:
+                print(f"⚠ SAM 3 sam3.sam3.build_sam3_image_model not available: {e1}")
+            except Exception as e1:
+                print(f"⚠ SAM 3 build_sam3_image_model failed: {e1}")
+                import traceback
+                traceback.print_exc()
+
+        # Method 2: Try sam3.sam3.model_builder
+        if not sam3_loaded:
+            try:
+                from sam3.sam3 import model_builder
+                print("Loading SAM 3 via sam3.sam3.model_builder...")
+                print(f"  model_builder contents: {dir(model_builder)}")
+
+                # Look for build functions in model_builder
+                build_funcs = [attr for attr in dir(model_builder) if 'build' in attr.lower() or 'sam' in attr.lower()]
+                print(f"  Available functions: {build_funcs}")
+
+                if hasattr(model_builder, 'build_sam3'):
+                    sam3_model = model_builder.build_sam3()
+                elif hasattr(model_builder, 'build_sam3_image_model'):
+                    sam3_model = model_builder.build_sam3_image_model()
+                else:
+                    raise ImportError(f"No build function found in model_builder: {build_funcs}")
+
+                sam3_model = sam3_model.to(device)
+                sam3_model.eval()
+                sam3_processor = sam3_model
+                sam3_loaded = True
+                print("✓ SAM 3 model initialized via model_builder")
             except ImportError as e2:
-                print(f"⚠ SAM 3 build_sam3 not available: {e2}")
+                print(f"⚠ SAM 3 model_builder not available: {e2}")
             except Exception as e2:
-                print(f"⚠ SAM 3 build_sam3 failed: {e2}")
+                print(f"⚠ SAM 3 model_builder failed: {e2}")
 
         # Method 3: Try HuggingFace (requires access approval)
         if not sam3_loaded:
@@ -230,21 +260,20 @@ def initialize_sam3_model():
             print("=" * 60)
             print("✗ SAM 3 could not be loaded. SAM3D routes will return 503 errors.")
             print("")
-            print("To enable SAM3, you need to:")
-            print("  Option A - Local installation:")
-            print("    1. git clone https://github.com/facebookresearch/sam3.git")
-            print("    2. cd sam3 && pip install -e .")
-            print("    3. Download checkpoint to sam3/checkpoints/")
+            print("SAM3 is installed but failed to load. Possible issues:")
+            print("  1. Missing checkpoint file in sam3/checkpoints/")
+            print("  2. Missing dependencies")
             print("")
-            print("  Option B - HuggingFace (gated model):")
-            print("    1. Request access at https://huggingface.co/facebook/sam3")
-            print("    2. huggingface-cli login")
+            print("Try downloading the checkpoint:")
+            print("  huggingface-cli download facebook/sam3 --local-dir ./sam3/checkpoints/")
             print("=" * 60)
             sam3_model = None
             sam3_processor = None
 
     except Exception as e:
         print(f"✗ SAM 3 initialization failed: {e}")
+        import traceback
+        traceback.print_exc()
         print("✗ SAM3D routes will not be available")
         SAM3_AVAILABLE = False
         sam3_model = None
