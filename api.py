@@ -160,56 +160,86 @@ def initialize_sam3_model():
         else:
             print(f"⚠ SAM3 path not found at {sam3_path}")
 
-        # Try importing SAM3 - the actual import depends on the sam3 repo structure
-        # Based on typical Meta AI model patterns, try common import patterns
         sam3_loaded = False
 
-        # Method 1: Try direct import from sam3 package
+        # Method 1: Try build_sam3_image_model (official SAM3 API pattern)
         try:
-            from sam3 import Sam3Model, Sam3Processor
-            sam3_model_id = "facebook/sam3"
-            print(f"Loading SAM 3 model from {sam3_model_id}...")
-            sam3_processor = Sam3Processor.from_pretrained(sam3_model_id)
-            sam3_model = Sam3Model.from_pretrained(sam3_model_id).to(device)
-            sam3_loaded = True
-            print("✓ SAM 3 model and processor initialized successfully")
-        except ImportError as e1:
-            print(f"⚠ SAM 3 direct import failed: {e1}")
+            from sam3 import build_sam3_image_model, SAM3ImagePredictor
+            print("Loading SAM 3 model via build_sam3_image_model...")
 
-        # Method 2: Try transformers-style import
+            # Check for local checkpoint first
+            checkpoint_path = "./sam3/checkpoints/sam3_hiera_large.pt"
+            if os.path.exists(checkpoint_path):
+                sam3_model = build_sam3_image_model(checkpoint=checkpoint_path)
+                print(f"✓ SAM 3 loaded from local checkpoint: {checkpoint_path}")
+            else:
+                # Try without explicit checkpoint (uses default)
+                sam3_model = build_sam3_image_model()
+                print("✓ SAM 3 loaded with default checkpoint")
+
+            sam3_model = sam3_model.to(device)
+            sam3_model.eval()
+
+            # Create predictor wrapper
+            sam3_processor = SAM3ImagePredictor(sam3_model)
+            sam3_loaded = True
+            print("✓ SAM 3 model and predictor initialized successfully")
+        except ImportError as e1:
+            print(f"⚠ SAM 3 build_sam3_image_model not available: {e1}")
+        except Exception as e1:
+            print(f"⚠ SAM 3 build_sam3_image_model failed: {e1}")
+
+        # Method 2: Try SAM3 predictor directly
+        if not sam3_loaded:
+            try:
+                from sam3.build_sam3 import build_sam3
+                from sam3.sam3_image_predictor import SAM3ImagePredictor as Sam3Predictor
+                print("Loading SAM 3 via build_sam3...")
+
+                sam3_model = build_sam3("sam3_hiera_large")
+                sam3_model = sam3_model.to(device)
+                sam3_model.eval()
+                sam3_processor = Sam3Predictor(sam3_model)
+                sam3_loaded = True
+                print("✓ SAM 3 model initialized via build_sam3")
+            except ImportError as e2:
+                print(f"⚠ SAM 3 build_sam3 not available: {e2}")
+            except Exception as e2:
+                print(f"⚠ SAM 3 build_sam3 failed: {e2}")
+
+        # Method 3: Try HuggingFace (requires access approval)
         if not sam3_loaded:
             try:
                 from transformers import AutoProcessor, AutoModel
                 sam3_model_id = "facebook/sam3"
-                print(f"Loading SAM 3 model from {sam3_model_id} (via transformers)...")
+                print(f"Loading SAM 3 from HuggingFace: {sam3_model_id}...")
+                print("  Note: This model is GATED. You need to:")
+                print("    1. Request access at https://huggingface.co/facebook/sam3")
+                print("    2. Run: huggingface-cli login")
                 sam3_processor = AutoProcessor.from_pretrained(sam3_model_id)
                 sam3_model = AutoModel.from_pretrained(sam3_model_id).to(device)
                 sam3_loaded = True
-                print("✓ SAM 3 model and processor initialized successfully (via transformers)")
-            except Exception as e2:
-                print(f"⚠ SAM 3 not available via transformers: {e2}")
-
-        # Method 3: Try Sam3Processor/Sam3Model from transformers (similar to Sam2)
-        if not sam3_loaded:
-            try:
-                from transformers import Sam3Processor as HFSam3Processor, Sam3Model as HFSam3Model
-                sam3_model_id = "facebook/sam3"
-                print(f"Loading SAM 3 model from {sam3_model_id} (via transformers Sam3*)...")
-                sam3_processor = HFSam3Processor.from_pretrained(sam3_model_id)
-                sam3_model = HFSam3Model.from_pretrained(sam3_model_id).to(device)
-                sam3_loaded = True
-                print("✓ SAM 3 model and processor initialized successfully (via transformers Sam3*)")
+                print("✓ SAM 3 loaded from HuggingFace")
             except Exception as e3:
-                print(f"⚠ SAM 3 not available via transformers Sam3*: {e3}")
+                print(f"⚠ SAM 3 HuggingFace load failed: {e3}")
 
         # Set availability based on actual loading success
         SAM3_AVAILABLE = sam3_loaded
 
         if not sam3_loaded:
+            print("=" * 60)
             print("✗ SAM 3 could not be loaded. SAM3D routes will return 503 errors.")
-            print("  Please ensure SAM3 is installed:")
-            print("    1. Clone: git clone https://github.com/facebookresearch/sam3.git")
-            print("    2. Install: cd sam3 && pip install -e .")
+            print("")
+            print("To enable SAM3, you need to:")
+            print("  Option A - Local installation:")
+            print("    1. git clone https://github.com/facebookresearch/sam3.git")
+            print("    2. cd sam3 && pip install -e .")
+            print("    3. Download checkpoint to sam3/checkpoints/")
+            print("")
+            print("  Option B - HuggingFace (gated model):")
+            print("    1. Request access at https://huggingface.co/facebook/sam3")
+            print("    2. huggingface-cli login")
+            print("=" * 60)
             sam3_model = None
             sam3_processor = None
 
@@ -421,7 +451,13 @@ async def segment_image_sam3d(request: SegmentSam3dRequest):
         if not SAM3_AVAILABLE or sam3_model is None or sam3_processor is None:
             return JSONResponse(
                 status_code=503,
-                content={"error": "SAM 3 model not available. Please install sam3."},
+                content={
+                    "error": "SAM 3 model not available. Please install sam3.",
+                    "instructions": [
+                        "Option A - Local: git clone https://github.com/facebookresearch/sam3.git && cd sam3 && pip install -e .",
+                        "Option B - HuggingFace: Request access at https://huggingface.co/facebook/sam3, then huggingface-cli login",
+                    ],
+                },
             )
 
         # Decode base64 image
@@ -436,69 +472,109 @@ async def segment_image_sam3d(request: SegmentSam3dRequest):
         image_pil = Image.open(io.BytesIO(image_data)).convert("RGB")
         image_np = np.array(image_pil)
 
-        # Prepare input points and labels in the format expected by the processor
-        # Format: [[[[x, y]]]] - 4 dimensions (image_dim, object_dim, point_per_object_dim, coordinates)
-        input_points = [[[[request.x, request.y]]]]
-        input_labels = [[[1]]]  # 1 for positive click, 0 for negative click
+        # Prepare point coordinates
+        point_coords = np.array([[request.x, request.y]])
+        point_labels = np.array([1])  # 1 for positive click
 
-        # Process inputs using SAM 3 processor
-        inputs = sam3_processor(
-            images=image_pil,
-            input_points=input_points,
-            input_labels=input_labels,
-            return_tensors="pt",
-        ).to(device)
+        # Check if using SAM3ImagePredictor (local) or HuggingFace style
+        if hasattr(sam3_processor, 'set_image'):
+            # SAM3ImagePredictor API (local installation)
+            sam3_processor.set_image(image_np)
 
-        # Run inference with SAM 3
-        with torch.no_grad():
-            outputs = sam3_model(**inputs)
+            with torch.no_grad():
+                masks, scores, logits = sam3_processor.predict(
+                    point_coords=point_coords,
+                    point_labels=point_labels,
+                    multimask_output=request.multimask_output,
+                )
 
-        # Post-process masks
-        masks = sam3_processor.post_process_masks(
-            outputs.pred_masks.cpu(), inputs["original_sizes"]
-        )[0]
+            # masks shape: [num_masks, H, W]
+            mask_list = []
+            for i in range(masks.shape[0]):
+                mask = masks[i]
 
-        # Convert masks to list and get scores
-        mask_list = []
-        scores = (
-            outputs.iou_preds[0].cpu().numpy().tolist()
-            if hasattr(outputs, "iou_preds")
-            else [0.95] * masks.shape[0]
-        )
+                # Threshold mask
+                mask = (mask > request.mask_threshold).astype(np.uint8) * 255
 
-        for i in range(masks.shape[0]):
-            mask = masks[i].numpy()
-            # Squeeze extra dimensions and ensure 2D
-            mask = np.squeeze(mask)
-            if mask.ndim != 2:
-                mask = mask[0] if mask.ndim > 2 else mask
+                # Apply morphological smoothing
+                kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+                mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+                mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
+                mask = cv2.GaussianBlur(mask, (5, 5), 0)
+                mask = (mask > 127).astype(np.uint8) * 255
 
-            # Threshold mask
-            mask = (mask > request.mask_threshold).astype(np.uint8) * 255
+                # Invert if requested
+                if request.invert_mask:
+                    mask = 255 - mask
 
-            # Apply morphological smoothing
-            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-            mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
-            mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
-            mask = cv2.GaussianBlur(mask, (5, 5), 0)
-            mask = (mask > 127).astype(np.uint8) * 255
+                mask_image = Image.fromarray(mask, mode="L")
+                buffer = io.BytesIO()
+                mask_image.save(buffer, format="PNG")
+                buffer.seek(0)
+                mask_base64 = base64.b64encode(buffer.getvalue()).decode("utf-8")
+                mask_list.append(
+                    {
+                        "mask": mask_base64,
+                        "mask_shape": list(mask.shape),
+                        "score": float(scores[i]) if i < len(scores) else 0.95,
+                    }
+                )
 
-            # Invert if requested
-            if request.invert_mask:
-                mask = 255 - mask
+        else:
+            # HuggingFace Transformers API
+            input_points = [[[[request.x, request.y]]]]
+            input_labels = [[[1]]]
 
-            mask_image = Image.fromarray(mask, mode="L")
-            buffer = io.BytesIO()
-            mask_image.save(buffer, format="PNG")
-            buffer.seek(0)
-            mask_base64 = base64.b64encode(buffer.getvalue()).decode("utf-8")
-            mask_list.append(
-                {
-                    "mask": mask_base64,
-                    "mask_shape": mask.shape,
-                    "score": float(scores[i]) if i < len(scores) else 0.95,
-                }
+            inputs = sam3_processor(
+                images=image_pil,
+                input_points=input_points,
+                input_labels=input_labels,
+                return_tensors="pt",
+            ).to(device)
+
+            with torch.no_grad():
+                outputs = sam3_model(**inputs)
+
+            masks = sam3_processor.post_process_masks(
+                outputs.pred_masks.cpu(), inputs["original_sizes"]
+            )[0]
+
+            mask_list = []
+            scores = (
+                outputs.iou_preds[0].cpu().numpy().tolist()
+                if hasattr(outputs, "iou_preds")
+                else [0.95] * masks.shape[0]
             )
+
+            for i in range(masks.shape[0]):
+                mask = masks[i].numpy()
+                mask = np.squeeze(mask)
+                if mask.ndim != 2:
+                    mask = mask[0] if mask.ndim > 2 else mask
+
+                mask = (mask > request.mask_threshold).astype(np.uint8) * 255
+
+                kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+                mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+                mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
+                mask = cv2.GaussianBlur(mask, (5, 5), 0)
+                mask = (mask > 127).astype(np.uint8) * 255
+
+                if request.invert_mask:
+                    mask = 255 - mask
+
+                mask_image = Image.fromarray(mask, mode="L")
+                buffer = io.BytesIO()
+                mask_image.save(buffer, format="PNG")
+                buffer.seek(0)
+                mask_base64 = base64.b64encode(buffer.getvalue()).decode("utf-8")
+                mask_list.append(
+                    {
+                        "mask": mask_base64,
+                        "mask_shape": list(mask.shape),
+                        "score": float(scores[i]) if i < len(scores) else 0.95,
+                    }
+                )
 
         return JSONResponse(
             {
@@ -511,6 +587,8 @@ async def segment_image_sam3d(request: SegmentSam3dRequest):
         )
 
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         return JSONResponse(status_code=400, content={"error": str(e)})
 
 
@@ -712,7 +790,13 @@ async def segment_image_binary_sam3d(request: SegmentBinarySam3dRequest):
         if not SAM3_AVAILABLE or sam3_model is None or sam3_processor is None:
             return JSONResponse(
                 status_code=503,
-                content={"error": "SAM 3 model not available. Please install sam3."},
+                content={
+                    "error": "SAM 3 model not available. Please install sam3.",
+                    "instructions": [
+                        "Option A - Local: git clone https://github.com/facebookresearch/sam3.git && cd sam3 && pip install -e .",
+                        "Option B - HuggingFace: Request access at https://huggingface.co/facebook/sam3, then huggingface-cli login",
+                    ],
+                },
             )
 
         # Decode base64 image
@@ -731,58 +815,74 @@ async def segment_image_binary_sam3d(request: SegmentBinarySam3dRequest):
 
         # Process image
         image_pil = Image.open(io.BytesIO(image_data)).convert("RGB")
-        image_pil_array = np.array(
-            image_pil
-        )  # Keep original image for color preservation
+        image_pil_array = np.array(image_pil)
+        image_np = image_pil_array
 
         # Collect masks from each point
         all_masks = []
-        best_mask_idx = 0
-        scores = np.array([0.95])
+        best_score = 0.95
 
-        for point_idx, point in enumerate(request.points):
+        # Check if using SAM3ImagePredictor (local) or HuggingFace style
+        if hasattr(sam3_processor, 'set_image'):
+            # SAM3ImagePredictor API (local installation)
+            sam3_processor.set_image(image_np)
 
-            # Process single point
-            input_points = [[[[point["x"], point["y"]]]]]
-            input_labels = [[[1]]]  # Positive point
+            for point in request.points:
+                point_coords = np.array([[point["x"], point["y"]]])
+                point_labels = np.array([1])  # Positive point
 
-            # Process inputs using SAM 3
-            inputs = sam3_processor(
-                images=image_pil,
-                input_points=input_points,
-                input_labels=input_labels,
-                return_tensors="pt",
-            ).to(device)
+                with torch.no_grad():
+                    masks, scores, logits = sam3_processor.predict(
+                        point_coords=point_coords,
+                        point_labels=point_labels,
+                        multimask_output=False,
+                    )
 
-            # Run inference with SAM 3
-            with torch.no_grad():
-                outputs = sam3_model(**inputs)
+                # Get best mask for this point
+                best_idx = np.argmax(scores)
+                point_mask = masks[best_idx]
+                best_score = float(scores[best_idx])
 
-            # Post-process masks
-            masks = sam3_processor.post_process_masks(
-                outputs.pred_masks.cpu(), inputs["original_sizes"]
-            )[0]
+                # Apply threshold
+                point_mask = (point_mask > request.mask_threshold).astype(np.uint8) * 255
+                all_masks.append(point_mask)
 
-            # Get scores
-            scores = (
-                outputs.iou_preds[0].cpu().numpy()
-                if hasattr(outputs, "iou_preds")
-                else np.array([0.95] * masks.shape[0])
-            )
+        else:
+            # HuggingFace Transformers API
+            for point in request.points:
+                input_points = [[[[point["x"], point["y"]]]]]
+                input_labels = [[[1]]]
 
-            # Get best mask for this point
-            best_mask_idx = np.argmax(scores)
-            point_mask = masks[best_mask_idx].numpy()
+                inputs = sam3_processor(
+                    images=image_pil,
+                    input_points=input_points,
+                    input_labels=input_labels,
+                    return_tensors="pt",
+                ).to(device)
 
-            # Squeeze and ensure 2D
-            point_mask = np.squeeze(point_mask)
-            if point_mask.ndim != 2:
-                point_mask = point_mask[0] if point_mask.ndim > 2 else point_mask
+                with torch.no_grad():
+                    outputs = sam3_model(**inputs)
 
-            # Apply threshold
-            point_mask = (point_mask > request.mask_threshold).astype(np.uint8) * 255
+                masks = sam3_processor.post_process_masks(
+                    outputs.pred_masks.cpu(), inputs["original_sizes"]
+                )[0]
 
-            all_masks.append(point_mask)
+                scores = (
+                    outputs.iou_preds[0].cpu().numpy()
+                    if hasattr(outputs, "iou_preds")
+                    else np.array([0.95] * masks.shape[0])
+                )
+
+                best_idx = np.argmax(scores)
+                point_mask = masks[best_idx].numpy()
+                best_score = float(scores[best_idx])
+
+                point_mask = np.squeeze(point_mask)
+                if point_mask.ndim != 2:
+                    point_mask = point_mask[0] if point_mask.ndim > 2 else point_mask
+
+                point_mask = (point_mask > request.mask_threshold).astype(np.uint8) * 255
+                all_masks.append(point_mask)
 
         # Union all masks from all points
         mask = all_masks[0].copy()
@@ -796,17 +896,6 @@ async def segment_image_binary_sam3d(request: SegmentBinarySam3dRequest):
                 prev_mask_pil = Image.open(io.BytesIO(mask_data)).convert("L")
                 prev_mask_array = np.array(prev_mask_pil)
                 mask = np.maximum(mask, prev_mask_array)
-            except Exception:
-                pass
-
-        mask = (mask > request.mask_threshold).astype(np.uint8) * 255
-
-        if request.previous_mask:
-            try:
-                mask_data = base64.b64decode(request.previous_mask)
-                prev_mask_pil = Image.open(io.BytesIO(mask_data)).convert("L")
-                prev_mask_np = np.array(prev_mask_pil)
-                mask = np.maximum(mask, prev_mask_np)
             except Exception:
                 pass
 
@@ -845,13 +934,11 @@ async def segment_image_binary_sam3d(request: SegmentBinarySam3dRequest):
         buffer.seek(0)
         mask_base64 = base64.b64encode(buffer.getvalue()).decode("utf-8")
 
-        score = float(scores[best_mask_idx])
-
         return JSONResponse(
             {
                 "success": True,
                 "mask": mask_base64,
-                "score": score,
+                "score": best_score,
                 "model": "sam3",
             }
         )
