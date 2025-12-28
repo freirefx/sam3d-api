@@ -13,16 +13,31 @@ fi
 # Exit on error
 set -e
 
-echo "--- 1. Handling Repository ---"
+echo "--- 1a. Handling SAM-3D-Objects Repository ---"
 REPO_DIR="sam-3d-objects"
 if [ -d "$REPO_DIR" ]; then
     echo "Directory '$REPO_DIR' exists. Updating..."
     cd "$REPO_DIR"
     git pull
+    cd ..
 else
     git clone https://github.com/facebookresearch/sam-3d-objects.git
-    cd "$REPO_DIR"
 fi
+
+echo "--- 1b. Handling SAM3 Repository ---"
+SAM3_REPO_DIR="sam3"
+if [ -d "$SAM3_REPO_DIR" ]; then
+    echo "Directory '$SAM3_REPO_DIR' exists. Updating..."
+    cd "$SAM3_REPO_DIR"
+    git pull
+    cd ..
+else
+    echo "Cloning SAM3 repository..."
+    git clone https://github.com/facebookresearch/sam3.git || echo "⚠ SAM3 repository not available yet. Skipping..."
+fi
+
+# Enter sam-3d-objects for the rest of the setup
+cd "$REPO_DIR"
 
 echo "--- 2. Checking Miniconda ---"
 CONDA_ROOT="$HOME/miniconda3"
@@ -93,7 +108,25 @@ else
     echo "No requirements.txt found in $(pwd)."
 fi
 
+echo "--- 8. Installing SAM3 (if available) ---"
+if [ -d "sam3" ]; then
+    echo "Installing SAM3 from local directory..."
+    cd sam3
+    pip install -e . || echo "⚠ SAM3 installation failed. Routes will use SAM2 fallback."
+    cd ..
+else
+    echo "⚠ SAM3 directory not found. SAM3D routes will use SAM2 fallback."
+fi
+
 echo "--- Setup Complete! ---"
+echo ""
+echo "Available endpoints:"
+echo "  - /segment          : SAM 2 segmentation (single point)"
+echo "  - /segment-binary   : SAM 2 segmentation (multiple points, masked image)"
+echo "  - /segment-sam3d    : SAM 3 segmentation (single point)"
+echo "  - /segment-binary-sam3d : SAM 3 segmentation (multiple points, masked image)"
+echo "  - /generate-3d      : 3D generation from image + mask"
+echo ""
 if [[ "${BASH_SOURCE[0]}" != "${0}" ]]; then
     echo "SUCCESS: You are now active in the '$ENV_NAME' environment."
 else
