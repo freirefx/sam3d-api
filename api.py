@@ -226,13 +226,49 @@ def initialize_sam3_model():
                 sam3_model = build_sam3_image_model(**kwargs)
 
                 # Model is already on device and in eval mode from build function
-                sam3_processor = sam3_model
+                # Try to find a predictor wrapper
+                predictor_found = False
+                predictor_paths = [
+                    "sam3.sam3_image_predictor",
+                    "sam3.predictor",
+                    "sam3.SAM3ImagePredictor",
+                    "sam3.SAM3Predictor",
+                ]
+                
+                for pred_path in predictor_paths:
+                    try:
+                        if "." in pred_path:
+                            module_path, class_name = pred_path.rsplit(".", 1)
+                            module = __import__(module_path, fromlist=[class_name])
+                            if hasattr(module, class_name):
+                                PredictorClass = getattr(module, class_name)
+                                sam3_processor = PredictorClass(sam3_model)
+                                predictor_found = True
+                                print(f"  ✓ Found predictor: {pred_path}")
+                                break
+                    except (ImportError, AttributeError, TypeError):
+                        continue
+                
+                if not predictor_found:
+                    # Use model directly - we'll handle this in the routes
+                    sam3_processor = sam3_model
+                    print("  Using model directly (no separate predictor)")
+                
                 sam3_loaded = True
                 print("✓ SAM 3 model loaded successfully via build_sam3_image_model")
                 
                 # Print available methods for debugging
                 model_methods = [m for m in dir(sam3_model) if not m.startswith('_') and callable(getattr(sam3_model, m, None))]
                 print(f"  Available model methods: {model_methods[:20]}...")
+                
+                # Check forward signature
+                if hasattr(sam3_model, 'forward'):
+                    import inspect
+                    try:
+                        forward_sig = inspect.signature(sam3_model.forward)
+                        print(f"  Forward signature: {forward_sig}")
+                    except:
+                        pass
                 
             except Exception as e1:
                 print(f"⚠ SAM 3 build_sam3_image_model failed: {e1}")
@@ -579,34 +615,86 @@ async def segment_image_sam3d(request: SegmentSam3dRequest):
 
         elif hasattr(sam3_model, 'forward') and sam3_processor is sam3_model:
             # Direct model API (no separate predictor)
-            # Use SAM2-compatible interface with the model
+            # SAM3 may have different interface - try multiple approaches
             from torchvision.transforms import functional as TF
+            import inspect
 
-            # Prepare image tensor
+            # Prepare image tensor - SAM3 may expect different format
             image_tensor = TF.to_tensor(image_pil).unsqueeze(0).to(device)
+            image_np_normalized = image_np.astype(np.float32) / 255.0
+            image_tensor_from_np = torch.from_numpy(image_np_normalized).permute(2, 0, 1).unsqueeze(0).to(device)
 
-            # Prepare point prompts
-            point_coords_tensor = torch.tensor([[[request.x, request.y]]], dtype=torch.float32, device=device)
+            # Prepare point prompts - normalize coordinates to [0, 1]
+            h, w = image_np.shape[:2]
+            point_coords_normalized = np.array([[[request.x / w, request.y / h]]], dtype=np.float32)
+            point_coords_tensor = torch.from_numpy(point_coords_normalized).to(device)
             point_labels_tensor = torch.tensor([[1]], dtype=torch.int64, device=device)
 
+            # Try to get forward signature
+            forward_sig = None
+            if hasattr(sam3_model, 'forward'):
+                try:
+                    forward_sig = inspect.signature(sam3_model.forward)
+                except:
+                    pass
+
+            outputs = None
+            error_messages = []
+
             with torch.no_grad():
-                # Try different forward signatures
+                # Try different forward signatures based on SAM3 API
+                # Method 1: Direct call with image tensor and points
                 try:
                     outputs = sam3_model(
                         image_tensor,
                         point_coords=point_coords_tensor,
                         point_labels=point_labels_tensor,
                     )
-                except TypeError:
-                    # Try alternative signature
-                    outputs = sam3_model(
-                        batched_input=[{
-                            "image": image_tensor[0],
-                            "point_coords": point_coords_tensor[0],
-                            "point_labels": point_labels_tensor[0],
-                        }],
-                        multimask_output=request.multimask_output,
-                    )
+                except Exception as e1:
+                    error_messages.append(f"Method 1 (image_tensor): {str(e1)}")
+                    
+                    # Method 2: With normalized image from numpy
+                    try:
+                        outputs = sam3_model(
+                            image_tensor_from_np,
+                            point_coords=point_coords_tensor,
+                            point_labels=point_labels_tensor,
+                        )
+                    except Exception as e2:
+                        error_messages.append(f"Method 2 (image_tensor_from_np): {str(e2)}")
+                        
+                        # Method 3: Batched input format (SAM2-style)
+                        try:
+                            outputs = sam3_model(
+                                batched_input=[{
+                                    "image": image_tensor[0],
+                                    "point_coords": point_coords_tensor[0],
+                                    "point_labels": point_labels_tensor[0],
+                                }],
+                                multimask_output=request.multimask_output,
+                            )
+                        except Exception as e3:
+                            error_messages.append(f"Method 3 (batched_input): {str(e3)}")
+                            
+                            # Method 4: Try with image as numpy array
+                            try:
+                                outputs = sam3_model(
+                                    image_np,
+                                    point_coords=point_coords_normalized,
+                                    point_labels=np.array([[1]], dtype=np.int64),
+                                )
+                            except Exception as e4:
+                                error_messages.append(f"Method 4 (numpy): {str(e4)}")
+                                
+                                # If all methods fail, return error with details
+                                return JSONResponse(
+                                    status_code=500,
+                                    content={
+                                        "error": "SAM3 model forward call failed. Tried multiple interfaces.",
+                                        "attempts": error_messages,
+                                        "forward_signature": str(forward_sig) if forward_sig else "Could not inspect",
+                                    },
+                                )
 
             # Extract masks from output
             if isinstance(outputs, dict):
@@ -985,29 +1073,64 @@ async def segment_image_binary_sam3d(request: SegmentBinarySam3dRequest):
         elif hasattr(sam3_model, 'forward') and sam3_processor is sam3_model:
             # Direct model API (no separate predictor)
             from torchvision.transforms import functional as TF
+            import inspect
 
+            # Prepare image tensor - SAM3 may expect different format
             image_tensor = TF.to_tensor(image_pil).unsqueeze(0).to(device)
+            image_np_normalized = image_np.astype(np.float32) / 255.0
+            image_tensor_from_np = torch.from_numpy(image_np_normalized).permute(2, 0, 1).unsqueeze(0).to(device)
+
+            h, w = image_np.shape[:2]
 
             for point in request.points:
-                point_coords_tensor = torch.tensor([[[point["x"], point["y"]]]], dtype=torch.float32, device=device)
+                # Normalize coordinates to [0, 1]
+                point_coords_normalized = np.array([[[point["x"] / w, point["y"] / h]]], dtype=np.float32)
+                point_coords_tensor = torch.from_numpy(point_coords_normalized).to(device)
                 point_labels_tensor = torch.tensor([[1]], dtype=torch.int64, device=device)
 
+                outputs = None
+                error_messages = []
+
                 with torch.no_grad():
+                    # Try different forward signatures
                     try:
                         outputs = sam3_model(
                             image_tensor,
                             point_coords=point_coords_tensor,
                             point_labels=point_labels_tensor,
                         )
-                    except TypeError:
-                        outputs = sam3_model(
-                            batched_input=[{
-                                "image": image_tensor[0],
-                                "point_coords": point_coords_tensor[0],
-                                "point_labels": point_labels_tensor[0],
-                            }],
-                            multimask_output=False,
-                        )
+                    except Exception as e1:
+                        error_messages.append(f"Method 1: {str(e1)}")
+                        try:
+                            outputs = sam3_model(
+                                image_tensor_from_np,
+                                point_coords=point_coords_tensor,
+                                point_labels=point_labels_tensor,
+                            )
+                        except Exception as e2:
+                            error_messages.append(f"Method 2: {str(e2)}")
+                            try:
+                                outputs = sam3_model(
+                                    batched_input=[{
+                                        "image": image_tensor[0],
+                                        "point_coords": point_coords_tensor[0],
+                                        "point_labels": point_labels_tensor[0],
+                                    }],
+                                    multimask_output=False,
+                                )
+                            except Exception as e3:
+                                error_messages.append(f"Method 3: {str(e3)}")
+                                try:
+                                    outputs = sam3_model(
+                                        image_np,
+                                        point_coords=point_coords_normalized,
+                                        point_labels=np.array([[1]], dtype=np.int64),
+                                    )
+                                except Exception as e4:
+                                    error_messages.append(f"Method 4: {str(e4)}")
+                                    # Skip this point if all methods fail
+                                    print(f"⚠ Failed to process point {point}: {error_messages}")
+                                    continue
 
                 # Extract masks from output
                 if isinstance(outputs, dict):
