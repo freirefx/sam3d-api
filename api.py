@@ -184,26 +184,42 @@ def initialize_sam3_model():
                     print(f"  Using checkpoint: {checkpoint_path}")
                     sam3_model = build_sam3_image_model(checkpoint=checkpoint_path)
                 else:
-                    print("  No local checkpoint found, using default...")
+                    print("  No local checkpoint found, using default (will download)...")
                     sam3_model = build_sam3_image_model()
 
                 sam3_model = sam3_model.to(device)
                 sam3_model.eval()
 
-                # Try to get SAM3ImagePredictor
-                try:
-                    from sam3.sam3.sam3_image_predictor import SAM3ImagePredictor
-                    sam3_processor = SAM3ImagePredictor(sam3_model)
-                    print("✓ SAM 3 ImagePredictor initialized")
-                except ImportError:
-                    # Model might be usable directly or need different predictor
+                # Try to find SAM3ImagePredictor in various locations
+                predictor_found = False
+                predictor_paths = [
+                    "sam3.sam3.sam3_image_predictor",
+                    "sam3.sam3_image_predictor",
+                    "sam3.sam3.automatic_mask_generator",
+                ]
+
+                for pred_path in predictor_paths:
+                    try:
+                        module_path, class_name = pred_path.rsplit(".", 1) if "predictor" in pred_path.lower() else (pred_path, "SAM3ImagePredictor")
+                        if "predictor" in pred_path.lower():
+                            module = __import__(pred_path, fromlist=["SAM3ImagePredictor"])
+                            if hasattr(module, "SAM3ImagePredictor"):
+                                sam3_processor = module.SAM3ImagePredictor(sam3_model)
+                                predictor_found = True
+                                print(f"✓ SAM 3 ImagePredictor found at {pred_path}")
+                                break
+                    except (ImportError, AttributeError):
+                        continue
+
+                if not predictor_found:
+                    # Use model directly - we'll handle this in the routes
                     sam3_processor = sam3_model
-                    print("✓ SAM 3 model initialized (no separate predictor)")
+                    print("✓ SAM 3 model initialized (using model directly, no separate predictor)")
 
                 sam3_loaded = True
                 print("✓ SAM 3 model loaded successfully via build_sam3_image_model")
             except ImportError as e1:
-                print(f"⚠ SAM 3 sam3.sam3.build_sam3_image_model not available: {e1}")
+                print(f"⚠ SAM 3 sam3.sam3.build_sam3_image_model import failed: {e1}")
             except Exception as e1:
                 print(f"⚠ SAM 3 build_sam3_image_model failed: {e1}")
                 import traceback
@@ -505,9 +521,11 @@ async def segment_image_sam3d(request: SegmentSam3dRequest):
         point_coords = np.array([[request.x, request.y]])
         point_labels = np.array([1])  # 1 for positive click
 
-        # Check if using SAM3ImagePredictor (local) or HuggingFace style
+        # Determine which API to use based on what's available
+        mask_list = []
+
         if hasattr(sam3_processor, 'set_image'):
-            # SAM3ImagePredictor API (local installation)
+            # SAM3ImagePredictor API (local installation with predictor)
             sam3_processor.set_image(image_np)
 
             with torch.no_grad():
@@ -518,21 +536,16 @@ async def segment_image_sam3d(request: SegmentSam3dRequest):
                 )
 
             # masks shape: [num_masks, H, W]
-            mask_list = []
             for i in range(masks.shape[0]):
                 mask = masks[i]
-
-                # Threshold mask
                 mask = (mask > request.mask_threshold).astype(np.uint8) * 255
 
-                # Apply morphological smoothing
                 kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
                 mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
                 mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
                 mask = cv2.GaussianBlur(mask, (5, 5), 0)
                 mask = (mask > 127).astype(np.uint8) * 255
 
-                # Invert if requested
                 if request.invert_mask:
                     mask = 255 - mask
 
@@ -541,12 +554,93 @@ async def segment_image_sam3d(request: SegmentSam3dRequest):
                 mask_image.save(buffer, format="PNG")
                 buffer.seek(0)
                 mask_base64 = base64.b64encode(buffer.getvalue()).decode("utf-8")
-                mask_list.append(
-                    {
+                mask_list.append({
+                    "mask": mask_base64,
+                    "mask_shape": list(mask.shape),
+                    "score": float(scores[i]) if i < len(scores) else 0.95,
+                })
+
+        elif hasattr(sam3_model, 'forward') and sam3_processor is sam3_model:
+            # Direct model API (no separate predictor)
+            # Use SAM2-compatible interface with the model
+            from torchvision.transforms import functional as TF
+
+            # Prepare image tensor
+            image_tensor = TF.to_tensor(image_pil).unsqueeze(0).to(device)
+
+            # Prepare point prompts
+            point_coords_tensor = torch.tensor([[[request.x, request.y]]], dtype=torch.float32, device=device)
+            point_labels_tensor = torch.tensor([[1]], dtype=torch.int64, device=device)
+
+            with torch.no_grad():
+                # Try different forward signatures
+                try:
+                    outputs = sam3_model(
+                        image_tensor,
+                        point_coords=point_coords_tensor,
+                        point_labels=point_labels_tensor,
+                    )
+                except TypeError:
+                    # Try alternative signature
+                    outputs = sam3_model(
+                        batched_input=[{
+                            "image": image_tensor[0],
+                            "point_coords": point_coords_tensor[0],
+                            "point_labels": point_labels_tensor[0],
+                        }],
+                        multimask_output=request.multimask_output,
+                    )
+
+            # Extract masks from output
+            if isinstance(outputs, dict):
+                masks = outputs.get("masks", outputs.get("pred_masks", None))
+                scores = outputs.get("iou_predictions", outputs.get("scores", None))
+            elif isinstance(outputs, (list, tuple)):
+                masks = outputs[0] if len(outputs) > 0 else None
+                scores = outputs[1] if len(outputs) > 1 else None
+            else:
+                masks = outputs
+                scores = None
+
+            if masks is not None:
+                if isinstance(masks, torch.Tensor):
+                    masks = masks.cpu().numpy()
+                masks = np.squeeze(masks)
+                if masks.ndim == 2:
+                    masks = masks[np.newaxis, ...]
+
+                if scores is None:
+                    scores = [0.95] * len(masks)
+                elif isinstance(scores, torch.Tensor):
+                    scores = scores.cpu().numpy().flatten().tolist()
+
+                for i in range(len(masks)):
+                    mask = masks[i]
+                    mask = (mask > request.mask_threshold).astype(np.uint8) * 255
+
+                    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+                    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+                    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
+                    mask = cv2.GaussianBlur(mask, (5, 5), 0)
+                    mask = (mask > 127).astype(np.uint8) * 255
+
+                    if request.invert_mask:
+                        mask = 255 - mask
+
+                    mask_image = Image.fromarray(mask, mode="L")
+                    buffer = io.BytesIO()
+                    mask_image.save(buffer, format="PNG")
+                    buffer.seek(0)
+                    mask_base64 = base64.b64encode(buffer.getvalue()).decode("utf-8")
+                    mask_list.append({
                         "mask": mask_base64,
                         "mask_shape": list(mask.shape),
                         "score": float(scores[i]) if i < len(scores) else 0.95,
-                    }
+                    })
+            else:
+                return JSONResponse(
+                    status_code=500,
+                    content={"error": "SAM3 model returned no masks. Model API may be incompatible."},
                 )
 
         else:
@@ -568,7 +662,6 @@ async def segment_image_sam3d(request: SegmentSam3dRequest):
                 outputs.pred_masks.cpu(), inputs["original_sizes"]
             )[0]
 
-            mask_list = []
             scores = (
                 outputs.iou_preds[0].cpu().numpy().tolist()
                 if hasattr(outputs, "iou_preds")
@@ -597,13 +690,11 @@ async def segment_image_sam3d(request: SegmentSam3dRequest):
                 mask_image.save(buffer, format="PNG")
                 buffer.seek(0)
                 mask_base64 = base64.b64encode(buffer.getvalue()).decode("utf-8")
-                mask_list.append(
-                    {
-                        "mask": mask_base64,
-                        "mask_shape": list(mask.shape),
-                        "score": float(scores[i]) if i < len(scores) else 0.95,
-                    }
-                )
+                mask_list.append({
+                    "mask": mask_base64,
+                    "mask_shape": list(mask.shape),
+                    "score": float(scores[i]) if i < len(scores) else 0.95,
+                })
 
         return JSONResponse(
             {
@@ -851,9 +942,9 @@ async def segment_image_binary_sam3d(request: SegmentBinarySam3dRequest):
         all_masks = []
         best_score = 0.95
 
-        # Check if using SAM3ImagePredictor (local) or HuggingFace style
+        # Determine which API to use based on what's available
         if hasattr(sam3_processor, 'set_image'):
-            # SAM3ImagePredictor API (local installation)
+            # SAM3ImagePredictor API (local installation with predictor)
             sam3_processor.set_image(image_np)
 
             for point in request.points:
@@ -867,14 +958,69 @@ async def segment_image_binary_sam3d(request: SegmentBinarySam3dRequest):
                         multimask_output=False,
                     )
 
-                # Get best mask for this point
                 best_idx = np.argmax(scores)
                 point_mask = masks[best_idx]
                 best_score = float(scores[best_idx])
 
-                # Apply threshold
                 point_mask = (point_mask > request.mask_threshold).astype(np.uint8) * 255
                 all_masks.append(point_mask)
+
+        elif hasattr(sam3_model, 'forward') and sam3_processor is sam3_model:
+            # Direct model API (no separate predictor)
+            from torchvision.transforms import functional as TF
+
+            image_tensor = TF.to_tensor(image_pil).unsqueeze(0).to(device)
+
+            for point in request.points:
+                point_coords_tensor = torch.tensor([[[point["x"], point["y"]]]], dtype=torch.float32, device=device)
+                point_labels_tensor = torch.tensor([[1]], dtype=torch.int64, device=device)
+
+                with torch.no_grad():
+                    try:
+                        outputs = sam3_model(
+                            image_tensor,
+                            point_coords=point_coords_tensor,
+                            point_labels=point_labels_tensor,
+                        )
+                    except TypeError:
+                        outputs = sam3_model(
+                            batched_input=[{
+                                "image": image_tensor[0],
+                                "point_coords": point_coords_tensor[0],
+                                "point_labels": point_labels_tensor[0],
+                            }],
+                            multimask_output=False,
+                        )
+
+                # Extract masks from output
+                if isinstance(outputs, dict):
+                    masks = outputs.get("masks", outputs.get("pred_masks", None))
+                    scores = outputs.get("iou_predictions", outputs.get("scores", None))
+                elif isinstance(outputs, (list, tuple)):
+                    masks = outputs[0] if len(outputs) > 0 else None
+                    scores = outputs[1] if len(outputs) > 1 else None
+                else:
+                    masks = outputs
+                    scores = None
+
+                if masks is not None:
+                    if isinstance(masks, torch.Tensor):
+                        masks = masks.cpu().numpy()
+                    masks = np.squeeze(masks)
+                    if masks.ndim == 2:
+                        masks = masks[np.newaxis, ...]
+
+                    if scores is None:
+                        scores = np.array([0.95])
+                    elif isinstance(scores, torch.Tensor):
+                        scores = scores.cpu().numpy().flatten()
+
+                    best_idx = np.argmax(scores)
+                    point_mask = masks[best_idx]
+                    best_score = float(scores[best_idx])
+
+                    point_mask = (point_mask > request.mask_threshold).astype(np.uint8) * 255
+                    all_masks.append(point_mask)
 
         else:
             # HuggingFace Transformers API
@@ -912,6 +1058,13 @@ async def segment_image_binary_sam3d(request: SegmentBinarySam3dRequest):
 
                 point_mask = (point_mask > request.mask_threshold).astype(np.uint8) * 255
                 all_masks.append(point_mask)
+
+        # If no masks were collected, return an error
+        if not all_masks:
+            return JSONResponse(
+                status_code=500,
+                content={"error": "SAM3 model returned no masks. Model API may be incompatible."},
+            )
 
         # Union all masks from all points
         mask = all_masks[0].copy()
