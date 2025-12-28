@@ -161,97 +161,114 @@ def initialize_sam3_model():
             print(f"⚠ SAM3 path not found at {sam3_path}")
 
         sam3_loaded = False
+        build_sam3_image_model = None
 
-        # Method 1: Use sam3.sam3.build_sam3_image_model (CORRECT import path)
-        if not sam3_loaded:
+        # Try to find build_sam3_image_model in various locations
+        import_paths = [
+            ("sam3.sam3", "build_sam3_image_model"),
+            ("sam3", "build_sam3_image_model"),
+            ("sam3.build_sam3", "build_sam3_image_model"),
+            ("sam3.model_builder", "build_sam3_image_model"),
+        ]
+
+        for module_path, func_name in import_paths:
             try:
-                from sam3.sam3 import build_sam3_image_model
-                print("Loading SAM 3 via sam3.sam3.build_sam3_image_model...")
+                module = __import__(module_path, fromlist=[func_name])
+                if hasattr(module, func_name):
+                    build_sam3_image_model = getattr(module, func_name)
+                    print(f"✓ Found {func_name} in {module_path}")
+                    break
+            except ImportError:
+                continue
+
+        # Method 1: Use build_sam3_image_model if found
+        if build_sam3_image_model is not None and not sam3_loaded:
+            try:
+                print("Loading SAM 3 via build_sam3_image_model...")
+                
+                # Get function signature to understand parameters
+                import inspect
+                sig = inspect.signature(build_sam3_image_model)
+                print(f"  Function signature: {sig}")
 
                 # Check for local checkpoint
                 checkpoint_paths = [
-                    "./sam3/checkpoints/sam3_hiera_large.pt",
                     "./sam3/checkpoints/sam3.pt",
+                    "./sam3/checkpoints/sam3_hiera_large.pt",
                     "./sam3/checkpoints/sam3_hiera_base_plus.pt",
                 ]
                 checkpoint_path = None
                 for cp in checkpoint_paths:
                     if os.path.exists(cp):
                         checkpoint_path = cp
+                        print(f"  Found checkpoint: {checkpoint_path}")
                         break
 
-                if checkpoint_path:
-                    print(f"  Using checkpoint: {checkpoint_path}")
-                    sam3_model = build_sam3_image_model(checkpoint=checkpoint_path)
-                else:
-                    print("  No local checkpoint found, using default (will download)...")
-                    sam3_model = build_sam3_image_model()
+                # Use correct parameter names based on function signature
+                device_str = "cuda" if device.type == "cuda" else "cpu"
+                
+                # Build kwargs based on available parameters
+                kwargs = {}
+                param_names = list(sig.parameters.keys())
+                
+                if 'device' in param_names:
+                    kwargs['device'] = device_str
+                if 'checkpoint_path' in param_names and checkpoint_path:
+                    kwargs['checkpoint_path'] = checkpoint_path
+                if 'load_from_HF' in param_names:
+                    kwargs['load_from_HF'] = checkpoint_path is None
+                if 'enable_segmentation' in param_names:
+                    kwargs['enable_segmentation'] = True
+                if 'eval_mode' in param_names:
+                    kwargs['eval_mode'] = True
+                
+                print(f"  Calling with kwargs: {kwargs}")
+                sam3_model = build_sam3_image_model(**kwargs)
 
-                sam3_model = sam3_model.to(device)
-                sam3_model.eval()
-
-                # Try to find SAM3ImagePredictor in various locations
-                predictor_found = False
-                predictor_paths = [
-                    "sam3.sam3.sam3_image_predictor",
-                    "sam3.sam3_image_predictor",
-                    "sam3.sam3.automatic_mask_generator",
-                ]
-
-                for pred_path in predictor_paths:
-                    try:
-                        module_path, class_name = pred_path.rsplit(".", 1) if "predictor" in pred_path.lower() else (pred_path, "SAM3ImagePredictor")
-                        if "predictor" in pred_path.lower():
-                            module = __import__(pred_path, fromlist=["SAM3ImagePredictor"])
-                            if hasattr(module, "SAM3ImagePredictor"):
-                                sam3_processor = module.SAM3ImagePredictor(sam3_model)
-                                predictor_found = True
-                                print(f"✓ SAM 3 ImagePredictor found at {pred_path}")
-                                break
-                    except (ImportError, AttributeError):
-                        continue
-
-                if not predictor_found:
-                    # Use model directly - we'll handle this in the routes
-                    sam3_processor = sam3_model
-                    print("✓ SAM 3 model initialized (using model directly, no separate predictor)")
-
+                # Model is already on device and in eval mode from build function
+                sam3_processor = sam3_model
                 sam3_loaded = True
                 print("✓ SAM 3 model loaded successfully via build_sam3_image_model")
-            except ImportError as e1:
-                print(f"⚠ SAM 3 sam3.sam3.build_sam3_image_model import failed: {e1}")
+                
+                # Print available methods for debugging
+                model_methods = [m for m in dir(sam3_model) if not m.startswith('_') and callable(getattr(sam3_model, m, None))]
+                print(f"  Available model methods: {model_methods[:20]}...")
+                
             except Exception as e1:
                 print(f"⚠ SAM 3 build_sam3_image_model failed: {e1}")
                 import traceback
                 traceback.print_exc()
 
-        # Method 2: Try sam3.sam3.model_builder
+        # Method 2: Try to find any build function in sam3 module
         if not sam3_loaded:
             try:
-                from sam3.sam3 import model_builder
-                print("Loading SAM 3 via sam3.sam3.model_builder...")
-                print(f"  model_builder contents: {dir(model_builder)}")
-
-                # Look for build functions in model_builder
-                build_funcs = [attr for attr in dir(model_builder) if 'build' in attr.lower() or 'sam' in attr.lower()]
-                print(f"  Available functions: {build_funcs}")
-
-                if hasattr(model_builder, 'build_sam3'):
-                    sam3_model = model_builder.build_sam3()
-                elif hasattr(model_builder, 'build_sam3_image_model'):
-                    sam3_model = model_builder.build_sam3_image_model()
-                else:
-                    raise ImportError(f"No build function found in model_builder: {build_funcs}")
-
-                sam3_model = sam3_model.to(device)
-                sam3_model.eval()
-                sam3_processor = sam3_model
-                sam3_loaded = True
-                print("✓ SAM 3 model initialized via model_builder")
+                import sam3
+                print(f"SAM3 module contents: {dir(sam3)}")
+                
+                # Look for build functions
+                build_funcs = [attr for attr in dir(sam3) if 'build' in attr.lower()]
+                print(f"  Build functions found: {build_funcs}")
+                
+                for func_name in build_funcs:
+                    try:
+                        func = getattr(sam3, func_name)
+                        if callable(func):
+                            print(f"  Trying {func_name}...")
+                            sam3_model = func()
+                            sam3_model = sam3_model.to(device)
+                            sam3_model.eval()
+                            sam3_processor = sam3_model
+                            sam3_loaded = True
+                            print(f"✓ SAM 3 model initialized via sam3.{func_name}")
+                            break
+                    except Exception as e:
+                        print(f"    {func_name} failed: {e}")
+                        continue
+                        
             except ImportError as e2:
-                print(f"⚠ SAM 3 model_builder not available: {e2}")
+                print(f"⚠ SAM 3 module import failed: {e2}")
             except Exception as e2:
-                print(f"⚠ SAM 3 model_builder failed: {e2}")
+                print(f"⚠ SAM 3 module exploration failed: {e2}")
 
         # Method 3: Try HuggingFace (requires access approval)
         if not sam3_loaded:
