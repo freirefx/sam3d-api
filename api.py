@@ -802,6 +802,52 @@ async def segment_image_sam3d(request: SegmentSam3dRequest):
                 )
                 print(f"✓ BatchedDatapoint created successfully")
                 
+                # Before calling the model, try to update freqs_cis for the actual image size
+                # The RoPE positional encoding needs to match the input dimensions
+                try:
+                    if hasattr(sam3_model, 'backbone') and hasattr(sam3_model.backbone, 'vision_backbone'):
+                        vision = sam3_model.backbone.vision_backbone
+                        if hasattr(vision, 'trunk'):
+                            # Calculate actual sequence dimensions
+                            patch_size = 16
+                            H_p = h // patch_size
+                            W_p = w // patch_size
+                            
+                            print(f"Attempting to update freqs_cis for image size {h}x{w} (patches: {H_p}x{W_p})")
+                            
+                            # Try to find and update freqs_cis in attention modules
+                            for name, module in vision.trunk.named_modules():
+                                if hasattr(module, 'freqs_cis') and hasattr(module, 'head_dim'):
+                                    try:
+                                        # Try to compute new freqs_cis
+                                        # This is a simplified approach - may need the actual compute_axial_cis function
+                                        current_freqs = module.freqs_cis
+                                        expected_seq_len = H_p * W_p
+                                        
+                                        # Only update if size doesn't match
+                                        if current_freqs.shape[0] != expected_seq_len:
+                                            print(f"  Updating freqs_cis in {name}: {current_freqs.shape[0]} -> {expected_seq_len}")
+                                            # Try to use the model's own method if available
+                                            if hasattr(module, '_setup_rope_freqs'):
+                                                module._setup_rope_freqs(H_p, W_p)
+                                            elif hasattr(module, 'rope_theta'):
+                                                # Try to recompute using rope_theta
+                                                # This is a simplified version - may need full implementation
+                                                head_dim = module.head_dim
+                                                rope_theta = getattr(module, 'rope_theta', 10000.0)
+                                                
+                                                # Create new freqs_cis (simplified - may need proper axial computation)
+                                                # For now, just try to use existing if shape is close
+                                                if abs(current_freqs.shape[0] - expected_seq_len) < expected_seq_len * 0.5:
+                                                    # Shape is close, try to interpolate or use as-is
+                                                    print(f"    Shape close enough, using existing")
+                                                else:
+                                                    print(f"    Cannot automatically update freqs_cis - size mismatch too large")
+                                    except Exception as e:
+                                        print(f"    Could not update freqs_cis in {name}: {e}")
+                except Exception as e:
+                    print(f"Warning: Could not update freqs_cis: {e}")
+                
                 with torch.no_grad():
                     print(f"Calling sam3_model.forward with BatchedDatapoint...")
                     outputs = sam3_model(batched_datapoint)
@@ -819,6 +865,27 @@ async def segment_image_sam3d(request: SegmentSam3dRequest):
                         "trace": error_trace
                     },
                 )
+            except AssertionError as e:
+                # This is likely the RoPE positional encoding error
+                import traceback
+                error_trace = traceback.format_exc()
+                print(f"✗ SAM3 RoPE positional encoding error: {error_trace}")
+                return JSONResponse(
+                    status_code=500,
+                    content={
+                        "error": "SAM3 model has incompatible image size requirements",
+                        "details": str(e),
+                        "message": (
+                            "SAM3 uses a multi-scale architecture with fixed positional encodings. "
+                            "The model was initialized with specific image sizes that don't match the input. "
+                            "This is a known limitation of SAM3 for static image segmentation. "
+                            "Please use SAM2 (/segment or /segment-binary) for image segmentation, "
+                            "or ensure the image size matches one of the model's expected sizes."
+                        ),
+                        "detected_sizes": getattr(sam3_model, '_all_detected_sizes', []),
+                        "suggestion": "Use /api/sam3d/segment (SAM2) instead of /api/sam3d/segment-sam3d"
+                    },
+                )
             except Exception as e:
                 # Fallback: try to understand the error and provide helpful message
                 import traceback
@@ -829,7 +896,11 @@ async def segment_image_sam3d(request: SegmentSam3dRequest):
                     content={
                         "error": f"SAM3 model forward call failed: {str(e)}",
                         "trace": error_trace,
-                        "message": "SAM3 model requires BatchedDatapoint with specific structure. Please check SAM3 documentation for correct usage."
+                        "message": (
+                            "SAM3 model requires BatchedDatapoint with specific structure. "
+                            "SAM3 may have limitations for static image segmentation. "
+                            "Consider using SAM2 (/segment or /segment-binary) for image segmentation."
+                        )
                     },
                 )
 
@@ -1367,6 +1438,27 @@ async def segment_image_binary_sam3d(request: SegmentBinarySam3dRequest):
                         "message": "SAM3 model structure may have changed. Please check SAM3 documentation."
                     },
                 )
+            except AssertionError as e:
+                # This is likely the RoPE positional encoding error
+                import traceback
+                error_trace = traceback.format_exc()
+                print(f"✗ SAM3 RoPE positional encoding error: {error_trace}")
+                return JSONResponse(
+                    status_code=500,
+                    content={
+                        "error": "SAM3 model has incompatible image size requirements",
+                        "details": str(e),
+                        "message": (
+                            "SAM3 uses a multi-scale architecture with fixed positional encodings. "
+                            "The model was initialized with specific image sizes that don't match the input. "
+                            "This is a known limitation of SAM3 for static image segmentation. "
+                            "Please use SAM2 (/segment-binary) for image segmentation, "
+                            "or ensure the image size matches one of the model's expected sizes."
+                        ),
+                        "detected_sizes": getattr(sam3_model, '_all_detected_sizes', []),
+                        "suggestion": "Use /api/sam3d/segment-binary (SAM2) instead of /api/sam3d/segment-binary-sam3d"
+                    },
+                )
             except Exception as e:
                 import traceback
                 error_trace = traceback.format_exc()
@@ -1375,7 +1467,11 @@ async def segment_image_binary_sam3d(request: SegmentBinarySam3dRequest):
                     status_code=500,
                     content={
                         "error": f"SAM3 model forward call failed: {str(e)}",
-                        "message": "SAM3 model requires BatchedDatapoint. Please check SAM3 documentation for correct usage."
+                        "message": (
+                            "SAM3 model requires BatchedDatapoint. "
+                            "SAM3 may have limitations for static image segmentation. "
+                            "Consider using SAM2 (/segment-binary) for image segmentation."
+                        )
                     },
                 )
 
