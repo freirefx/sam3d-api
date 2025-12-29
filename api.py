@@ -125,6 +125,13 @@ sam3_model = None
 sam3_processor = None
 SAM3_AVAILABLE = False
 
+# Global video predictor instances (SAM 3 Video)
+sam3_video_predictor = None
+SAM3_VIDEO_AVAILABLE = False
+
+# Video session storage for tracking
+video_sessions: Dict[str, Dict] = {}
+
 # Task storage for async 3D generation
 generation_tasks: Dict[str, Dict] = {}
 
@@ -359,11 +366,93 @@ def initialize_sam3_model():
         sam3_processor = None
 
 
+def initialize_sam3_video_predictor():
+    """Initialize SAM 3 video predictor for video segmentation and tracking"""
+    global sam3_video_predictor, SAM3_VIDEO_AVAILABLE
+
+    try:
+        # Try to import build_sam3_video_predictor
+        sam3_path = "./sam3"
+        if os.path.exists(sam3_path) and sam3_path not in sys.path:
+            sys.path.insert(0, sam3_path)
+
+        build_sam3_video_predictor = None
+        import_paths = [
+            ("sam3.model_builder", "build_sam3_video_predictor"),
+            ("sam3.sam3", "build_sam3_video_predictor"),
+            ("sam3", "build_sam3_video_predictor"),
+            ("sam3.video_predictor", "build_sam3_video_predictor"),
+        ]
+
+        for module_path, func_name in import_paths:
+            try:
+                module = __import__(module_path, fromlist=[func_name])
+                if hasattr(module, func_name):
+                    build_sam3_video_predictor = getattr(module, func_name)
+                    print(f"✓ Found {func_name} in {module_path}")
+                    break
+            except ImportError:
+                continue
+
+        if build_sam3_video_predictor is None:
+            print("⚠ build_sam3_video_predictor not found. Video routes will not be available.")
+            SAM3_VIDEO_AVAILABLE = False
+            return
+
+        # Check for video checkpoint
+        checkpoint_paths = [
+            "./sam3/checkpoints/sam3_video.pt",
+            "./sam3/checkpoints/sam3_hiera_large.pt",
+            "./sam3/checkpoints/sam3.pt",
+        ]
+        checkpoint_path = None
+        for cp in checkpoint_paths:
+            if os.path.exists(cp):
+                checkpoint_path = cp
+                print(f"  Found video checkpoint: {checkpoint_path}")
+                break
+
+        # Build the video predictor
+        device_str = "cuda" if device.type == "cuda" else "cpu"
+        
+        import inspect
+        sig = inspect.signature(build_sam3_video_predictor)
+        print(f"  build_sam3_video_predictor signature: {sig}")
+
+        kwargs = {}
+        param_names = list(sig.parameters.keys())
+
+        if 'device' in param_names:
+            kwargs['device'] = device_str
+        if 'checkpoint' in param_names and checkpoint_path:
+            kwargs['checkpoint'] = checkpoint_path
+        elif 'checkpoint_path' in param_names and checkpoint_path:
+            kwargs['checkpoint_path'] = checkpoint_path
+
+        print(f"  Calling build_sam3_video_predictor with: {kwargs}")
+        sam3_video_predictor = build_sam3_video_predictor(**kwargs)
+
+        SAM3_VIDEO_AVAILABLE = True
+        print("✓ SAM 3 video predictor initialized successfully")
+
+        # Print available methods
+        predictor_methods = [m for m in dir(sam3_video_predictor) if not m.startswith('_') and callable(getattr(sam3_video_predictor, m, None))]
+        print(f"  Available predictor methods: {predictor_methods[:15]}...")
+
+    except Exception as e:
+        print(f"⚠ SAM 3 video predictor initialization failed: {e}")
+        import traceback
+        traceback.print_exc()
+        SAM3_VIDEO_AVAILABLE = False
+        sam3_video_predictor = None
+
+
 @app.on_event("startup")
 async def startup_event():
     """Initialize models on API startup"""
     initialize_model()
     initialize_sam3_model()
+    initialize_sam3_video_predictor()
 
 
 @app.get("/health")
@@ -371,6 +460,7 @@ async def health_check():
     """Health check endpoint"""
     sam2_ready = model is not None and processor is not None
     sam3_ready = SAM3_AVAILABLE and sam3_model is not None and sam3_processor is not None
+    sam3_video_ready = SAM3_VIDEO_AVAILABLE and sam3_video_predictor is not None
 
     return {
         "status": "healthy" if sam2_ready else "degraded",
@@ -382,9 +472,33 @@ async def health_check():
         "sam3": {
             "loaded": sam3_ready,
             "model_id": "facebook/sam3" if sam3_ready else None,
-            "routes": ["/segment-sam3d", "/segment-binary-sam3d"],
+            "routes": {
+                "image": [
+                    "/segment-sam3d",
+                    "/segment-binary-sam3d",
+                    "/segment-text-sam3d",
+                    "/segment-box-sam3d",
+                    "/segment-mask-sam3d",
+                    "/segment-auto-sam3d",
+                ],
+                "video": [
+                    "/video/start-session",
+                    "/video/add-prompt",
+                    "/video/propagate",
+                    "/video/get-frame/{session_id}/{frame_index}",
+                    "/video/remove-object/{session_id}/{object_id}",
+                    "/video/end-session/{session_id}",
+                ] if sam3_video_ready else [],
+            },
+            "video_available": sam3_video_ready,
             "error": None if sam3_ready else "SAM3 not installed. Run: git clone https://github.com/facebookresearch/sam3.git && cd sam3 && pip install -e .",
         },
+        "sam3d": {
+            "loaded": True,
+            "routes": ["/generate-3d", "/generate-3d-status/{task_id}"],
+        },
+        "active_video_sessions": len(video_sessions),
+        "active_3d_tasks": len(generation_tasks),
         "device": str(device),
     }
 
@@ -1796,6 +1910,1175 @@ async def segment_image_binary_sam3d(request: SegmentBinarySam3dRequest):
 
         traceback.print_exc()
         return JSONResponse(status_code=400, content={"error": str(e)})
+
+
+# ============================================================================
+# SAM 3 ADVANCED SEGMENTATION ROUTES (Text, Box, Mask, Auto)
+# ============================================================================
+
+
+class SegmentTextSam3dRequest(BaseModel):
+    image: str  # base64 encoded image
+    prompt: str  # Text description: "orange cat", "person with hat"
+    box_threshold: float = 0.3  # Confidence threshold for detection
+    text_threshold: float = 0.25  # Text similarity threshold
+    multimask_output: bool = False  # Return multiple mask candidates
+    invert_mask: bool = False  # Invert the mask
+
+
+@app.post("/segment-text-sam3d")
+async def segment_text_sam3d(request: SegmentTextSam3dRequest):
+    """
+    Segment an object in an image using a text prompt (SAM 3).
+
+    Args:
+        request: JSON body containing:
+            - image: Base64 encoded image string
+            - prompt: Text description of object to segment ("orange cat", "person with hat")
+            - box_threshold: Confidence threshold for detection (default: 0.3)
+            - text_threshold: Text similarity threshold (default: 0.25)
+            - multimask_output: Whether to return multiple masks (default: False)
+            - invert_mask: Whether to invert the mask (default: False)
+
+    Returns:
+        JSON response containing:
+        - masks: List of segmentation masks as base64 PNG images with scores
+        - boxes: Detected bounding boxes
+        - prompt: The text prompt used
+        - image_shape: Dimensions of the input image
+        - model: The model used for segmentation
+    """
+    try:
+        if not SAM3_AVAILABLE or sam3_model is None or sam3_processor is None:
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": "SAM 3 model not available. Please install sam3.",
+                    "instructions": [
+                        "git clone https://github.com/facebookresearch/sam3.git && cd sam3 && pip install -e .",
+                    ],
+                },
+            )
+
+        # Decode base64 image
+        try:
+            image_data = base64.b64decode(request.image)
+        except Exception as e:
+            return JSONResponse(
+                status_code=400, content={"error": f"Invalid base64 image: {str(e)}"}
+            )
+
+        # Process image
+        image_pil = Image.open(io.BytesIO(image_data)).convert("RGB")
+        image_np = np.array(image_pil)
+
+        mask_list = []
+        boxes_list = []
+
+        # Check if processor has set_text_prompt method
+        if hasattr(sam3_processor, 'set_image') and hasattr(sam3_processor, 'set_text_prompt'):
+            try:
+                # Use Sam3Processor API
+                inference_state = sam3_processor.set_image(image_pil)
+                print(f"✓ Image set for text prompt, inference_state type: {type(inference_state)}")
+
+                # Call set_text_prompt
+                output = sam3_processor.set_text_prompt(
+                    state=inference_state,
+                    prompt=request.prompt,
+                    box_threshold=request.box_threshold,
+                    text_threshold=request.text_threshold,
+                )
+                print(f"✓ Text prompt processed, output keys: {list(output.keys()) if isinstance(output, dict) else type(output)}")
+
+                # Extract masks and boxes from output
+                masks = output.get("masks", None)
+                boxes = output.get("boxes", None)
+                scores = output.get("scores", None)
+
+                if masks is not None:
+                    # Convert masks to numpy
+                    if isinstance(masks, torch.Tensor):
+                        masks = masks.float().cpu().numpy()
+                    masks = np.squeeze(masks)
+                    if masks.ndim == 2:
+                        masks = masks[np.newaxis, ...]
+
+                    if scores is None:
+                        scores = [0.95] * len(masks)
+                    elif isinstance(scores, torch.Tensor):
+                        scores = scores.float().cpu().numpy().flatten().tolist()
+
+                    # Limit masks if not multimask_output
+                    if not request.multimask_output and len(masks) > 1:
+                        best_idx = np.argmax(scores) if len(scores) > 0 else 0
+                        masks = masks[best_idx:best_idx+1]
+                        scores = [scores[best_idx]] if len(scores) > best_idx else [0.95]
+
+                    # Process each mask
+                    for i in range(len(masks)):
+                        mask = masks[i]
+                        mask = (mask > 0).astype(np.uint8) * 255
+
+                        # Apply morphological smoothing
+                        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+                        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+                        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
+                        mask = cv2.GaussianBlur(mask, (5, 5), 0)
+                        mask = (mask > 127).astype(np.uint8) * 255
+
+                        if request.invert_mask:
+                            mask = 255 - mask
+
+                        mask_image = Image.fromarray(mask, mode="L")
+                        buffer = io.BytesIO()
+                        mask_image.save(buffer, format="PNG")
+                        buffer.seek(0)
+                        mask_base64 = base64.b64encode(buffer.getvalue()).decode("utf-8")
+                        mask_list.append({
+                            "mask": mask_base64,
+                            "mask_shape": list(mask.shape),
+                            "score": float(scores[i]) if i < len(scores) else 0.95,
+                        })
+
+                # Extract boxes
+                if boxes is not None:
+                    if isinstance(boxes, torch.Tensor):
+                        boxes = boxes.float().cpu().numpy()
+                    boxes_list = boxes.tolist() if hasattr(boxes, 'tolist') else list(boxes)
+
+            except AttributeError as e:
+                print(f"⚠ Sam3Processor missing method: {e}")
+                return JSONResponse(
+                    status_code=501,
+                    content={
+                        "error": f"Text prompt not supported by this SAM3 version: {str(e)}",
+                        "message": "The installed SAM3 version may not support set_text_prompt(). Please check documentation.",
+                    },
+                )
+        else:
+            return JSONResponse(
+                status_code=501,
+                content={
+                    "error": "Text prompt not available",
+                    "message": "Sam3Processor does not have set_text_prompt method. This feature requires SAM3 with text encoder.",
+                },
+            )
+
+        if not mask_list:
+            return JSONResponse(
+                status_code=404,
+                content={
+                    "error": "No objects found matching the text prompt",
+                    "prompt": request.prompt,
+                    "suggestion": "Try adjusting box_threshold or text_threshold, or use a different description.",
+                },
+            )
+
+        return JSONResponse(
+            {
+                "success": True,
+                "masks": mask_list,
+                "boxes": boxes_list,
+                "prompt": request.prompt,
+                "image_shape": [image_pil.height, image_pil.width],
+                "model": "sam3",
+            }
+        )
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return JSONResponse(status_code=400, content={"error": str(e)})
+
+
+class SegmentBoxSam3dRequest(BaseModel):
+    image: str  # base64 encoded image
+    box: List[float]  # [x1, y1, x2, y2] bounding box coordinates
+    multimask_output: bool = True  # Return multiple mask candidates
+    mask_threshold: float = 0.0  # Threshold for mask logits
+    invert_mask: bool = False  # Invert the mask
+
+
+@app.post("/segment-box-sam3d")
+async def segment_box_sam3d(request: SegmentBoxSam3dRequest):
+    """
+    Segment an object in an image using a bounding box prompt (SAM 3).
+
+    Args:
+        request: JSON body containing:
+            - image: Base64 encoded image string
+            - box: Bounding box coordinates [x1, y1, x2, y2]
+            - multimask_output: Whether to return multiple masks (default: True)
+            - mask_threshold: Threshold for mask logits (default: 0.0)
+            - invert_mask: Whether to invert the mask (default: False)
+
+    Returns:
+        JSON response containing:
+        - masks: List of segmentation masks as base64 PNG images with scores
+        - box: The bounding box used
+        - image_shape: Dimensions of the input image
+        - model: The model used for segmentation
+    """
+    try:
+        if not SAM3_AVAILABLE or sam3_model is None or sam3_processor is None:
+            return JSONResponse(
+                status_code=503,
+                content={"error": "SAM 3 model not available."},
+            )
+
+        # Validate box
+        if len(request.box) != 4:
+            return JSONResponse(
+                status_code=400,
+                content={"error": "Box must have exactly 4 coordinates [x1, y1, x2, y2]"},
+            )
+
+        # Decode base64 image
+        try:
+            image_data = base64.b64decode(request.image)
+        except Exception as e:
+            return JSONResponse(
+                status_code=400, content={"error": f"Invalid base64 image: {str(e)}"}
+            )
+
+        # Process image
+        image_pil = Image.open(io.BytesIO(image_data)).convert("RGB")
+        image_np = np.array(image_pil)
+        h, w = image_np.shape[:2]
+
+        mask_list = []
+
+        # Check if processor has set_box_prompt or add_geometric_prompt
+        if hasattr(sam3_processor, 'set_image'):
+            try:
+                inference_state = sam3_processor.set_image(image_pil)
+                print(f"✓ Image set for box prompt")
+
+                if hasattr(sam3_processor, 'set_box_prompt'):
+                    # Direct set_box_prompt API
+                    box_np = np.array(request.box)
+                    output = sam3_processor.set_box_prompt(
+                        state=inference_state,
+                        box=box_np,
+                        multimask_output=request.multimask_output,
+                    )
+                elif hasattr(sam3_processor, 'add_geometric_prompt'):
+                    # Convert box to normalized cxcywh format
+                    x1, y1, x2, y2 = request.box
+                    center_x = ((x1 + x2) / 2) / w
+                    center_y = ((y1 + y2) / 2) / h
+                    box_width = (x2 - x1) / w
+                    box_height = (y2 - y1) / h
+                    box_cxcywh = [center_x, center_y, box_width, box_height]
+
+                    print(f"Box converted to cxcywh: {box_cxcywh}")
+
+                    inference_state = sam3_processor.add_geometric_prompt(
+                        box=box_cxcywh,
+                        label=True,
+                        state=inference_state
+                    )
+                    output = inference_state
+                else:
+                    return JSONResponse(
+                        status_code=501,
+                        content={"error": "Box prompt not supported by this SAM3 version."},
+                    )
+
+                # Extract masks
+                masks = output.get("masks", None) if isinstance(output, dict) else None
+                scores = output.get("scores", None) if isinstance(output, dict) else None
+
+                if masks is not None:
+                    if isinstance(masks, torch.Tensor):
+                        masks = masks.float().cpu().numpy()
+                    elif isinstance(masks, list) and len(masks) > 0:
+                        if isinstance(masks[0], torch.Tensor):
+                            masks = np.stack([m.float().cpu().numpy() for m in masks])
+                        else:
+                            masks = np.array(masks)
+                    masks = np.squeeze(masks)
+                    if masks.ndim == 2:
+                        masks = masks[np.newaxis, ...]
+
+                    if scores is None:
+                        scores = [0.95] * len(masks)
+                    elif isinstance(scores, torch.Tensor):
+                        scores = scores.float().cpu().numpy().flatten().tolist()
+
+                    if not request.multimask_output and len(masks) > 1:
+                        best_idx = np.argmax(scores) if len(scores) > 0 else 0
+                        masks = masks[best_idx:best_idx+1]
+                        scores = [scores[best_idx]] if len(scores) > best_idx else [0.95]
+
+                    for i in range(len(masks)):
+                        mask = masks[i]
+                        mask = (mask > request.mask_threshold).astype(np.uint8) * 255
+
+                        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+                        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+                        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
+                        mask = cv2.GaussianBlur(mask, (5, 5), 0)
+                        mask = (mask > 127).astype(np.uint8) * 255
+
+                        if request.invert_mask:
+                            mask = 255 - mask
+
+                        mask_image = Image.fromarray(mask, mode="L")
+                        buffer = io.BytesIO()
+                        mask_image.save(buffer, format="PNG")
+                        buffer.seek(0)
+                        mask_base64 = base64.b64encode(buffer.getvalue()).decode("utf-8")
+                        mask_list.append({
+                            "mask": mask_base64,
+                            "mask_shape": list(mask.shape),
+                            "score": float(scores[i]) if i < len(scores) else 0.95,
+                        })
+
+            except Exception as e:
+                import traceback
+                traceback.print_exc()
+                return JSONResponse(
+                    status_code=500,
+                    content={"error": f"Box prompt processing failed: {str(e)}"},
+                )
+        else:
+            return JSONResponse(
+                status_code=501,
+                content={"error": "Sam3Processor does not support box prompts."},
+            )
+
+        if not mask_list:
+            return JSONResponse(
+                status_code=500,
+                content={"error": "No masks generated from box prompt."},
+            )
+
+        return JSONResponse(
+            {
+                "success": True,
+                "masks": mask_list,
+                "box": request.box,
+                "image_shape": [image_pil.height, image_pil.width],
+                "model": "sam3",
+            }
+        )
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return JSONResponse(status_code=400, content={"error": str(e)})
+
+
+class SegmentMaskSam3dRequest(BaseModel):
+    image: str  # base64 encoded image
+    mask_input: str  # base64 encoded initial mask for refinement
+    multimask_output: bool = True  # Return multiple mask candidates
+    mask_threshold: float = 0.0  # Threshold for mask logits
+    invert_mask: bool = False  # Invert the mask
+
+
+@app.post("/segment-mask-sam3d")
+async def segment_mask_sam3d(request: SegmentMaskSam3dRequest):
+    """
+    Refine a segmentation mask using SAM 3's mask prompt feature.
+
+    Args:
+        request: JSON body containing:
+            - image: Base64 encoded image string
+            - mask_input: Base64 encoded initial mask to refine
+            - multimask_output: Whether to return multiple masks (default: True)
+            - mask_threshold: Threshold for mask logits (default: 0.0)
+            - invert_mask: Whether to invert the mask (default: False)
+
+    Returns:
+        JSON response containing:
+        - masks: List of refined segmentation masks as base64 PNG images
+        - image_shape: Dimensions of the input image
+        - model: The model used for segmentation
+    """
+    try:
+        if not SAM3_AVAILABLE or sam3_model is None or sam3_processor is None:
+            return JSONResponse(
+                status_code=503,
+                content={"error": "SAM 3 model not available."},
+            )
+
+        # Decode base64 image
+        try:
+            image_data = base64.b64decode(request.image)
+        except Exception as e:
+            return JSONResponse(
+                status_code=400, content={"error": f"Invalid base64 image: {str(e)}"}
+            )
+
+        # Decode base64 mask
+        try:
+            mask_data = base64.b64decode(request.mask_input)
+            mask_pil = Image.open(io.BytesIO(mask_data)).convert("L")
+            mask_input_np = np.array(mask_pil)
+        except Exception as e:
+            return JSONResponse(
+                status_code=400, content={"error": f"Invalid base64 mask: {str(e)}"}
+            )
+
+        # Process image
+        image_pil = Image.open(io.BytesIO(image_data)).convert("RGB")
+        image_np = np.array(image_pil)
+
+        # Validate dimensions match
+        if image_np.shape[:2] != mask_input_np.shape:
+            return JSONResponse(
+                status_code=400,
+                content={"error": f"Image and mask dimensions must match. Image: {image_np.shape[:2]}, Mask: {mask_input_np.shape}"},
+            )
+
+        mask_list = []
+
+        if hasattr(sam3_processor, 'set_image') and hasattr(sam3_processor, 'set_mask_prompt'):
+            try:
+                inference_state = sam3_processor.set_image(image_pil)
+                print(f"✓ Image set for mask refinement")
+
+                # Normalize mask to 0-1 range
+                mask_input_normalized = (mask_input_np > 127).astype(np.float32)
+
+                output = sam3_processor.set_mask_prompt(
+                    state=inference_state,
+                    mask_input=mask_input_normalized,
+                    multimask_output=request.multimask_output,
+                )
+                print(f"✓ Mask refinement processed")
+
+                masks = output.get("masks", None) if isinstance(output, dict) else None
+                scores = output.get("scores", None) if isinstance(output, dict) else None
+
+                if masks is not None:
+                    if isinstance(masks, torch.Tensor):
+                        masks = masks.float().cpu().numpy()
+                    masks = np.squeeze(masks)
+                    if masks.ndim == 2:
+                        masks = masks[np.newaxis, ...]
+
+                    if scores is None:
+                        scores = [0.95] * len(masks)
+                    elif isinstance(scores, torch.Tensor):
+                        scores = scores.float().cpu().numpy().flatten().tolist()
+
+                    if not request.multimask_output and len(masks) > 1:
+                        best_idx = np.argmax(scores) if len(scores) > 0 else 0
+                        masks = masks[best_idx:best_idx+1]
+                        scores = [scores[best_idx]] if len(scores) > best_idx else [0.95]
+
+                    for i in range(len(masks)):
+                        mask = masks[i]
+                        mask = (mask > request.mask_threshold).astype(np.uint8) * 255
+
+                        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+                        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+                        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
+                        mask = cv2.GaussianBlur(mask, (5, 5), 0)
+                        mask = (mask > 127).astype(np.uint8) * 255
+
+                        if request.invert_mask:
+                            mask = 255 - mask
+
+                        mask_image = Image.fromarray(mask, mode="L")
+                        buffer = io.BytesIO()
+                        mask_image.save(buffer, format="PNG")
+                        buffer.seek(0)
+                        mask_base64 = base64.b64encode(buffer.getvalue()).decode("utf-8")
+                        mask_list.append({
+                            "mask": mask_base64,
+                            "mask_shape": list(mask.shape),
+                            "score": float(scores[i]) if i < len(scores) else 0.95,
+                        })
+
+            except AttributeError as e:
+                return JSONResponse(
+                    status_code=501,
+                    content={"error": f"Mask refinement not supported: {str(e)}"},
+                )
+        else:
+            return JSONResponse(
+                status_code=501,
+                content={"error": "Sam3Processor does not support mask refinement."},
+            )
+
+        if not mask_list:
+            return JSONResponse(
+                status_code=500,
+                content={"error": "No refined masks generated."},
+            )
+
+        return JSONResponse(
+            {
+                "success": True,
+                "masks": mask_list,
+                "image_shape": [image_pil.height, image_pil.width],
+                "model": "sam3",
+            }
+        )
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return JSONResponse(status_code=400, content={"error": str(e)})
+
+
+class SegmentAutoSam3dRequest(BaseModel):
+    image: str  # base64 encoded image
+    points_per_side: int = 32  # Number of points per side of the grid
+    pred_iou_thresh: float = 0.88  # IoU threshold for filtering masks
+    stability_score_thresh: float = 0.95  # Stability score threshold
+    min_mask_region_area: int = 0  # Minimum mask region area in pixels
+
+
+@app.post("/segment-auto-sam3d")
+async def segment_auto_sam3d(request: SegmentAutoSam3dRequest):
+    """
+    Automatically generate all possible segmentation masks in an image (SAM 3).
+
+    Args:
+        request: JSON body containing:
+            - image: Base64 encoded image string
+            - points_per_side: Number of points per side of sampling grid (default: 32)
+            - pred_iou_thresh: IoU threshold for mask quality (default: 0.88)
+            - stability_score_thresh: Stability score threshold (default: 0.95)
+            - min_mask_region_area: Minimum mask area in pixels (default: 0)
+
+    Returns:
+        JSON response containing:
+        - masks: List of all detected masks with segmentation, bbox, area, and scores
+        - count: Number of masks found
+        - image_shape: Dimensions of the input image
+        - model: The model used for segmentation
+    """
+    try:
+        if not SAM3_AVAILABLE or sam3_model is None:
+            return JSONResponse(
+                status_code=503,
+                content={"error": "SAM 3 model not available."},
+            )
+
+        # Decode base64 image
+        try:
+            image_data = base64.b64decode(request.image)
+        except Exception as e:
+            return JSONResponse(
+                status_code=400, content={"error": f"Invalid base64 image: {str(e)}"}
+            )
+
+        image_pil = Image.open(io.BytesIO(image_data)).convert("RGB")
+        image_np = np.array(image_pil)
+
+        mask_list = []
+
+        # Try to import and use Sam3AutomaticMaskGenerator
+        try:
+            Sam3AutomaticMaskGenerator = None
+
+            # Try different import paths
+            import_paths = [
+                "sam3.Sam3AutomaticMaskGenerator",
+                "sam3.automatic_mask_generator.Sam3AutomaticMaskGenerator",
+                "sam3.sam3_automatic_mask_generator.Sam3AutomaticMaskGenerator",
+            ]
+
+            for path in import_paths:
+                try:
+                    module_path, class_name = path.rsplit(".", 1)
+                    module = __import__(module_path, fromlist=[class_name])
+                    if hasattr(module, class_name):
+                        Sam3AutomaticMaskGenerator = getattr(module, class_name)
+                        print(f"✓ Found {class_name} in {module_path}")
+                        break
+                except ImportError:
+                    continue
+
+            if Sam3AutomaticMaskGenerator is None:
+                return JSONResponse(
+                    status_code=501,
+                    content={
+                        "error": "Sam3AutomaticMaskGenerator not available",
+                        "message": "Automatic mask generation requires SAM3 with AutomaticMaskGenerator.",
+                    },
+                )
+
+            # Create generator
+            generator = Sam3AutomaticMaskGenerator(
+                model=sam3_model,
+                points_per_side=request.points_per_side,
+                pred_iou_thresh=request.pred_iou_thresh,
+                stability_score_thresh=request.stability_score_thresh,
+                min_mask_region_area=request.min_mask_region_area,
+            )
+
+            print(f"✓ AutomaticMaskGenerator created, running on image...")
+
+            # Generate masks
+            with torch.no_grad():
+                masks_output = generator.generate(image_np)
+
+            print(f"✓ Generated {len(masks_output)} masks")
+
+            # Process each mask
+            for mask_info in masks_output:
+                segmentation = mask_info.get("segmentation", None)
+                if segmentation is not None:
+                    # Convert to uint8
+                    mask = (segmentation > 0).astype(np.uint8) * 255
+
+                    mask_image = Image.fromarray(mask, mode="L")
+                    buffer = io.BytesIO()
+                    mask_image.save(buffer, format="PNG")
+                    buffer.seek(0)
+                    mask_base64 = base64.b64encode(buffer.getvalue()).decode("utf-8")
+
+                    mask_list.append({
+                        "mask": mask_base64,
+                        "bbox": mask_info.get("bbox", []),
+                        "area": mask_info.get("area", 0),
+                        "predicted_iou": mask_info.get("predicted_iou", 0.0),
+                        "stability_score": mask_info.get("stability_score", 0.0),
+                    })
+
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            return JSONResponse(
+                status_code=500,
+                content={"error": f"Automatic mask generation failed: {str(e)}"},
+            )
+
+        return JSONResponse(
+            {
+                "success": True,
+                "masks": mask_list,
+                "count": len(mask_list),
+                "image_shape": [image_pil.height, image_pil.width],
+                "model": "sam3",
+                "parameters": {
+                    "points_per_side": request.points_per_side,
+                    "pred_iou_thresh": request.pred_iou_thresh,
+                    "stability_score_thresh": request.stability_score_thresh,
+                },
+            }
+        )
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return JSONResponse(status_code=400, content={"error": str(e)})
+
+
+# ============================================================================
+# SAM 3 VIDEO SEGMENTATION ROUTES
+# ============================================================================
+
+
+def cleanup_video_session(session_id: str):
+    """Clean up a video session and free resources"""
+    if session_id in video_sessions:
+        session = video_sessions[session_id]
+        # Try to release any resources
+        if "inference_state" in session:
+            del session["inference_state"]
+        if "video_path" in session and session.get("temp_video", False):
+            try:
+                if os.path.exists(session["video_path"]):
+                    os.unlink(session["video_path"])
+            except:
+                pass
+        del video_sessions[session_id]
+        print(f"[Video] Session {session_id} cleaned up")
+
+
+class VideoStartSessionRequest(BaseModel):
+    video: Optional[str] = None  # base64 encoded video (optional)
+    video_path: Optional[str] = None  # Path to video file on server
+    resource_type: str = "video"  # Type of resource
+
+
+@app.post("/video/start-session")
+async def video_start_session(request: VideoStartSessionRequest):
+    """
+    Start a new video segmentation session.
+
+    Args:
+        request: JSON body containing:
+            - video: Base64 encoded video file (optional, use video_path instead)
+            - video_path: Path to video file on server (optional)
+            - resource_type: Type of resource (default: "video")
+
+    Returns:
+        JSON response containing:
+        - session_id: Unique session ID for subsequent requests
+        - num_frames: Total number of frames in the video
+        - video_height: Height of video frames
+        - video_width: Width of video frames
+    """
+    try:
+        if not SAM3_VIDEO_AVAILABLE or sam3_video_predictor is None:
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": "SAM 3 video predictor not available.",
+                    "instructions": "Install SAM3 with video support and download video checkpoints.",
+                },
+            )
+
+        # Handle video input
+        video_path = None
+        temp_video = False
+
+        if request.video:
+            # Decode base64 video to temp file
+            try:
+                video_data = base64.b64decode(request.video)
+                with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
+                    tmp.write(video_data)
+                    video_path = tmp.name
+                    temp_video = True
+            except Exception as e:
+                return JSONResponse(
+                    status_code=400, content={"error": f"Invalid base64 video: {str(e)}"}
+                )
+        elif request.video_path:
+            if not os.path.exists(request.video_path):
+                return JSONResponse(
+                    status_code=400, content={"error": f"Video file not found: {request.video_path}"}
+                )
+            video_path = request.video_path
+        else:
+            return JSONResponse(
+                status_code=400, content={"error": "Either 'video' or 'video_path' must be provided"}
+            )
+
+        # Create session ID
+        session_id = str(uuid.uuid4())
+
+        # Call predictor's handle_request with start_session
+        if hasattr(sam3_video_predictor, 'handle_request'):
+            response = sam3_video_predictor.handle_request({
+                "type": "start_session",
+                "resource_path": video_path,
+                "resource_type": request.resource_type,
+            })
+
+            # Store session info
+            video_sessions[session_id] = {
+                "predictor_session_id": response.get("session_id", session_id),
+                "video_path": video_path,
+                "temp_video": temp_video,
+                "num_frames": response.get("num_frames", 0),
+                "video_height": response.get("video_height", 0),
+                "video_width": response.get("video_width", 0),
+                "objects": {},  # Track object IDs and their prompts
+                "created_at": str(np.datetime64("now")),
+            }
+
+            return JSONResponse({
+                "success": True,
+                "session_id": session_id,
+                "num_frames": response.get("num_frames", 0),
+                "video_height": response.get("video_height", 0),
+                "video_width": response.get("video_width", 0),
+            })
+        else:
+            # Fallback: Use direct API if available
+            return JSONResponse(
+                status_code=501,
+                content={"error": "Video predictor does not have handle_request method."},
+            )
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+
+class VideoAddPromptRequest(BaseModel):
+    session_id: str  # Session ID from start-session
+    frame_index: int  # Frame to add prompt on
+    object_id: int  # ID for the object to track
+    # Prompt options (one of these should be provided)
+    text: Optional[str] = None  # Text prompt
+    point_coords: Optional[List[List[float]]] = None  # [[x, y], ...]
+    point_labels: Optional[List[int]] = None  # [1, 1, 0, ...] (1=foreground, 0=background)
+    box: Optional[List[float]] = None  # [x1, y1, x2, y2]
+    mask: Optional[str] = None  # base64 encoded mask
+
+
+@app.post("/video/add-prompt")
+async def video_add_prompt(request: VideoAddPromptRequest):
+    """
+    Add a segmentation prompt for an object in a specific frame.
+
+    Args:
+        request: JSON body containing:
+            - session_id: Session ID from start-session
+            - frame_index: Frame index to add prompt on
+            - object_id: ID for the object to track
+            - text: Text description (optional)
+            - point_coords: List of point coordinates [[x, y], ...] (optional)
+            - point_labels: List of point labels [1=fg, 0=bg] (optional)
+            - box: Bounding box [x1, y1, x2, y2] (optional)
+            - mask: Base64 encoded mask (optional)
+
+    Returns:
+        JSON response containing:
+        - object_id: The object ID
+        - frame_index: The frame index
+        - mask: Base64 encoded mask for this frame
+        - score: Confidence score
+    """
+    try:
+        if not SAM3_VIDEO_AVAILABLE or sam3_video_predictor is None:
+            return JSONResponse(
+                status_code=503,
+                content={"error": "SAM 3 video predictor not available."},
+            )
+
+        if request.session_id not in video_sessions:
+            return JSONResponse(
+                status_code=404,
+                content={"error": f"Session {request.session_id} not found."},
+            )
+
+        session = video_sessions[request.session_id]
+        predictor_session_id = session.get("predictor_session_id", request.session_id)
+
+        # Build prompt request
+        prompt_request = {
+            "type": "add_prompt",
+            "session_id": predictor_session_id,
+            "frame_index": request.frame_index,
+            "object_id": request.object_id,
+        }
+
+        # Add prompt data
+        if request.text:
+            prompt_request["text"] = request.text
+        if request.point_coords:
+            prompt_request["point_coords"] = request.point_coords
+            prompt_request["point_labels"] = request.point_labels or [1] * len(request.point_coords)
+        if request.box:
+            prompt_request["box"] = request.box
+        if request.mask:
+            try:
+                mask_data = base64.b64decode(request.mask)
+                mask_pil = Image.open(io.BytesIO(mask_data)).convert("L")
+                mask_np = np.array(mask_pil)
+                prompt_request["mask"] = mask_np
+            except Exception as e:
+                return JSONResponse(
+                    status_code=400, content={"error": f"Invalid mask: {str(e)}"}
+                )
+
+        # Call predictor
+        if hasattr(sam3_video_predictor, 'handle_request'):
+            response = sam3_video_predictor.handle_request(prompt_request)
+
+            # Track object in session
+            session["objects"][request.object_id] = {
+                "frame_index": request.frame_index,
+                "prompt_type": "text" if request.text else "points" if request.point_coords else "box" if request.box else "mask",
+            }
+
+            # Encode mask to base64
+            mask_b64 = None
+            if "mask" in response and response["mask"] is not None:
+                mask_np = response["mask"]
+                if isinstance(mask_np, torch.Tensor):
+                    mask_np = mask_np.cpu().numpy()
+                mask_np = np.squeeze(mask_np)
+                mask_np = (mask_np > 0).astype(np.uint8) * 255
+                mask_image = Image.fromarray(mask_np, mode="L")
+                buffer = io.BytesIO()
+                mask_image.save(buffer, format="PNG")
+                buffer.seek(0)
+                mask_b64 = base64.b64encode(buffer.getvalue()).decode("utf-8")
+
+            return JSONResponse({
+                "success": True,
+                "object_id": request.object_id,
+                "frame_index": request.frame_index,
+                "mask": mask_b64,
+                "score": response.get("score", 0.95),
+            })
+        else:
+            return JSONResponse(
+                status_code=501,
+                content={"error": "Video predictor does not support add_prompt."},
+            )
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+
+class VideoPropagateRequest(BaseModel):
+    session_id: str  # Session ID
+    start_frame: int = 0  # Starting frame
+    max_frame: Optional[int] = None  # Maximum frame to propagate to
+
+
+@app.post("/video/propagate")
+async def video_propagate(request: VideoPropagateRequest):
+    """
+    Propagate segmentation masks through the video.
+
+    Args:
+        request: JSON body containing:
+            - session_id: Session ID from start-session
+            - start_frame: Starting frame index (default: 0)
+            - max_frame: Maximum frame to propagate to (optional)
+
+    Returns:
+        JSON response containing:
+        - masks: Dict of masks by object_id and frame_index
+        - scores: Dict of scores by object_id and frame_index
+        - num_frames_processed: Number of frames processed
+    """
+    try:
+        if not SAM3_VIDEO_AVAILABLE or sam3_video_predictor is None:
+            return JSONResponse(
+                status_code=503,
+                content={"error": "SAM 3 video predictor not available."},
+            )
+
+        if request.session_id not in video_sessions:
+            return JSONResponse(
+                status_code=404,
+                content={"error": f"Session {request.session_id} not found."},
+            )
+
+        session = video_sessions[request.session_id]
+        predictor_session_id = session.get("predictor_session_id", request.session_id)
+
+        # Build propagate request
+        propagate_request = {
+            "type": "propagate_in_video",
+            "session_id": predictor_session_id,
+            "start_frame": request.start_frame,
+        }
+        if request.max_frame is not None:
+            propagate_request["max_frame"] = request.max_frame
+
+        # Call predictor
+        if hasattr(sam3_video_predictor, 'handle_request'):
+            response = sam3_video_predictor.handle_request(propagate_request)
+
+            # Process masks - encode each to base64
+            masks_encoded = {}
+            scores_output = {}
+
+            if "masks" in response:
+                for obj_id, frame_masks in response["masks"].items():
+                    masks_encoded[str(obj_id)] = {}
+                    for frame_idx, mask in frame_masks.items():
+                        if isinstance(mask, torch.Tensor):
+                            mask = mask.cpu().numpy()
+                        mask = np.squeeze(mask)
+                        mask = (mask > 0).astype(np.uint8) * 255
+                        mask_image = Image.fromarray(mask, mode="L")
+                        buffer = io.BytesIO()
+                        mask_image.save(buffer, format="PNG")
+                        buffer.seek(0)
+                        masks_encoded[str(obj_id)][str(frame_idx)] = base64.b64encode(buffer.getvalue()).decode("utf-8")
+
+            if "scores" in response:
+                for obj_id, frame_scores in response["scores"].items():
+                    scores_output[str(obj_id)] = {str(k): float(v) for k, v in frame_scores.items()}
+
+            return JSONResponse({
+                "success": True,
+                "masks": masks_encoded,
+                "scores": scores_output,
+                "num_frames_processed": len(next(iter(masks_encoded.values()), {})) if masks_encoded else 0,
+            })
+        else:
+            return JSONResponse(
+                status_code=501,
+                content={"error": "Video predictor does not support propagate."},
+            )
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+
+@app.get("/video/get-frame/{session_id}/{frame_index}")
+async def video_get_frame(session_id: str, frame_index: int):
+    """
+    Get a specific frame from the video with masks applied.
+
+    Args:
+        session_id: Session ID from start-session
+        frame_index: Frame index to retrieve
+
+    Returns:
+        JSON response containing:
+        - frame: Base64 encoded frame image
+        - frame_index: The frame index
+        - masks: Dict of masks for each tracked object in this frame
+    """
+    try:
+        if not SAM3_VIDEO_AVAILABLE or sam3_video_predictor is None:
+            return JSONResponse(
+                status_code=503,
+                content={"error": "SAM 3 video predictor not available."},
+            )
+
+        if session_id not in video_sessions:
+            return JSONResponse(
+                status_code=404,
+                content={"error": f"Session {session_id} not found."},
+            )
+
+        session = video_sessions[session_id]
+        predictor_session_id = session.get("predictor_session_id", session_id)
+
+        # Call predictor to get frame
+        if hasattr(sam3_video_predictor, 'handle_request'):
+            response = sam3_video_predictor.handle_request({
+                "type": "get_frame",
+                "session_id": predictor_session_id,
+                "frame_index": frame_index,
+            })
+
+            # Encode frame to base64
+            frame_b64 = None
+            if "frame" in response and response["frame"] is not None:
+                frame_np = response["frame"]
+                if isinstance(frame_np, torch.Tensor):
+                    frame_np = frame_np.cpu().numpy()
+                frame_image = Image.fromarray(frame_np.astype(np.uint8), mode="RGB")
+                buffer = io.BytesIO()
+                frame_image.save(buffer, format="PNG")
+                buffer.seek(0)
+                frame_b64 = base64.b64encode(buffer.getvalue()).decode("utf-8")
+
+            return JSONResponse({
+                "success": True,
+                "frame": frame_b64,
+                "frame_index": frame_index,
+            })
+        else:
+            return JSONResponse(
+                status_code=501,
+                content={"error": "Video predictor does not support get_frame."},
+            )
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+
+@app.delete("/video/remove-object/{session_id}/{object_id}")
+async def video_remove_object(session_id: str, object_id: int):
+    """
+    Remove a tracked object from the video session.
+
+    Args:
+        session_id: Session ID from start-session
+        object_id: Object ID to remove
+
+    Returns:
+        JSON response containing:
+        - success: Whether the object was removed
+        - object_id: The removed object ID
+    """
+    try:
+        if not SAM3_VIDEO_AVAILABLE or sam3_video_predictor is None:
+            return JSONResponse(
+                status_code=503,
+                content={"error": "SAM 3 video predictor not available."},
+            )
+
+        if session_id not in video_sessions:
+            return JSONResponse(
+                status_code=404,
+                content={"error": f"Session {session_id} not found."},
+            )
+
+        session = video_sessions[session_id]
+        predictor_session_id = session.get("predictor_session_id", session_id)
+
+        # Call predictor
+        if hasattr(sam3_video_predictor, 'handle_request'):
+            response = sam3_video_predictor.handle_request({
+                "type": "remove_object",
+                "session_id": predictor_session_id,
+                "object_id": object_id,
+            })
+
+            # Remove from local tracking
+            if object_id in session.get("objects", {}):
+                del session["objects"][object_id]
+
+            return JSONResponse({
+                "success": response.get("success", True),
+                "object_id": object_id,
+            })
+        else:
+            return JSONResponse(
+                status_code=501,
+                content={"error": "Video predictor does not support remove_object."},
+            )
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+
+@app.delete("/video/end-session/{session_id}")
+async def video_end_session(session_id: str):
+    """
+    End a video segmentation session and free resources.
+
+    Args:
+        session_id: Session ID from start-session
+
+    Returns:
+        JSON response containing:
+        - success: Whether the session was ended
+    """
+    try:
+        if session_id not in video_sessions:
+            return JSONResponse(
+                status_code=404,
+                content={"error": f"Session {session_id} not found."},
+            )
+
+        session = video_sessions[session_id]
+        predictor_session_id = session.get("predictor_session_id", session_id)
+
+        # Call predictor to end session
+        if SAM3_VIDEO_AVAILABLE and sam3_video_predictor is not None:
+            if hasattr(sam3_video_predictor, 'handle_request'):
+                sam3_video_predictor.handle_request({
+                    "type": "end_session",
+                    "session_id": predictor_session_id,
+                })
+
+        # Clean up local session
+        cleanup_video_session(session_id)
+
+        return JSONResponse({
+            "success": True,
+        })
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return JSONResponse(status_code=500, content={"error": str(e)})
 
 
 class Generate3dRequest(BaseModel):

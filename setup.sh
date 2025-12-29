@@ -118,14 +118,74 @@ else
     echo "⚠ SAM3 directory not found. SAM3D routes will use SAM2 fallback."
 fi
 
+echo "--- 8b. Downloading SAM3 Checkpoints (Image + Video) ---"
+if [ -d "sam3" ]; then
+    mkdir -p sam3/checkpoints
+    
+    # Download image checkpoint if not present
+    if [ ! -f "sam3/checkpoints/sam3_hiera_large.pt" ] && [ ! -f "sam3/checkpoints/sam3.pt" ]; then
+        echo "Downloading SAM3 image checkpoint..."
+        huggingface-cli download facebook/sam3 sam3_hiera_large.pt --local-dir sam3/checkpoints/ || \
+        huggingface-cli download facebook/sam3 --local-dir sam3/checkpoints/ || \
+        echo "⚠ Could not download SAM3 checkpoint. Please download manually or request access at https://huggingface.co/facebook/sam3"
+    else
+        echo "SAM3 image checkpoint already present."
+    fi
+    
+    # Download video checkpoint if not present
+    if [ ! -f "sam3/checkpoints/sam3_video.pt" ]; then
+        echo "Downloading SAM3 video checkpoint..."
+        huggingface-cli download facebook/sam3 sam3_video.pt --local-dir sam3/checkpoints/ || \
+        echo "⚠ Could not download SAM3 video checkpoint. Video features may not be available."
+    else
+        echo "SAM3 video checkpoint already present."
+    fi
+else
+    echo "⚠ SAM3 directory not found. Skipping checkpoint download."
+fi
+
+echo "--- 9. Installing Video Processing Dependencies ---"
+pip install decord av imageio imageio-ffmpeg || echo "⚠ Some video dependencies failed to install."
+
+echo "--- 10. Validating SAM3 Installation ---"
+python -c "
+try:
+    import sam3
+    print('✓ SAM3 module imported successfully')
+    if hasattr(sam3, 'build_sam3_image_model'):
+        print('  - build_sam3_image_model: available')
+    if hasattr(sam3, 'build_sam3_video_predictor'):
+        print('  - build_sam3_video_predictor: available')
+except ImportError as e:
+    print(f'⚠ SAM3 import failed: {e}')
+" || echo "⚠ SAM3 validation skipped (not installed)"
+
 echo "--- Setup Complete! ---"
 echo ""
 echo "Available endpoints:"
-echo "  - /segment          : SAM 2 segmentation (single point)"
-echo "  - /segment-binary   : SAM 2 segmentation (multiple points, masked image)"
-echo "  - /segment-sam3d    : SAM 3 segmentation (single point)"
-echo "  - /segment-binary-sam3d : SAM 3 segmentation (multiple points, masked image)"
-echo "  - /generate-3d      : 3D generation from image + mask"
+echo ""
+echo "  SAM 2 (Image):"
+echo "    - /segment          : Single point segmentation"
+echo "    - /segment-binary   : Multiple points, masked image"
+echo ""
+echo "  SAM 3 (Image):"
+echo "    - /segment-sam3d        : Single point segmentation"
+echo "    - /segment-binary-sam3d : Multiple points, masked image"
+echo "    - /segment-text-sam3d   : Text prompt segmentation"
+echo "    - /segment-box-sam3d    : Bounding box segmentation"
+echo "    - /segment-mask-sam3d   : Mask refinement"
+echo "    - /segment-auto-sam3d   : Automatic mask generation"
+echo ""
+echo "  SAM 3 (Video):"
+echo "    - /video/start-session  : Start video session"
+echo "    - /video/add-prompt     : Add prompt to frame"
+echo "    - /video/propagate      : Propagate masks"
+echo "    - /video/get-frame      : Get frame with masks"
+echo "    - /video/remove-object  : Remove tracked object"
+echo "    - /video/end-session    : End session"
+echo ""
+echo "  3D Generation:"
+echo "    - /generate-3d      : 3D generation from image + mask"
 echo ""
 if [[ "${BASH_SOURCE[0]}" != "${0}" ]]; then
     echo "SUCCESS: You are now active in the '$ENV_NAME' environment."
