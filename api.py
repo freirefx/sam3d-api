@@ -503,14 +503,28 @@ async def segment_image(request: SegmentRequest):
                 }
             )
 
-        return JSONResponse(
-            {
+        print(f"✓ Preparing response: {len(mask_list)} masks")
+        print(f"  Input point: ({request.x}, {request.y})")
+        print(f"  Image shape: {image_pil.height}x{image_pil.width}")
+        
+        try:
+            response_data = {
                 "success": True,
                 "masks": mask_list,
                 "input_point": [request.x, request.y],
                 "image_shape": [image_pil.height, image_pil.width],
             }
-        )
+            print(f"  Response data keys: {list(response_data.keys())}")
+            print(f"  Number of masks in response: {len(response_data['masks'])}")
+            
+            response = JSONResponse(content=response_data)
+            print(f"✓ Response created successfully")
+            return response
+        except Exception as e:
+            import traceback
+            error_trace = traceback.format_exc()
+            print(f"✗ Error creating response: {error_trace}")
+            raise
 
     except Exception as e:
         import traceback
@@ -765,6 +779,34 @@ async def segment_image_sam3d(request: SegmentSam3dRequest):
                         import traceback
                         error_trace = traceback.format_exc()
                         print(f"      ✗ Error processing mask {i+1}: {error_trace}")
+                        raise
+                
+                print(f"  ✓ All {len(mask_list)} masks processed successfully")
+                
+                # If we have masks, return them (don't try direct model API)
+                if mask_list:
+                    print(f"✓ Returning {len(mask_list)} masks from Sam3Processor")
+                    print(f"  Preparing response: {len(mask_list)} masks")
+                    print(f"  Input point: ({request.x}, {request.y})")
+                    print(f"  Image shape: {image_pil.height}x{image_pil.width}")
+                    
+                    try:
+                        response_data = {
+                            "success": True,
+                            "masks": mask_list,
+                            "input_point": [request.x, request.y],
+                            "image_shape": [image_pil.height, image_pil.width],
+                        }
+                        print(f"  Response data keys: {list(response_data.keys())}")
+                        print(f"  Number of masks in response: {len(response_data['masks'])}")
+                        
+                        response = JSONResponse(content=response_data)
+                        print(f"✓ Response created successfully")
+                        return response
+                    except Exception as e:
+                        import traceback
+                        error_trace = traceback.format_exc()
+                        print(f"✗ Error creating response: {error_trace}")
                         raise
             else:
                 # Sam3Processor failed, fall through to direct model API
