@@ -714,34 +714,58 @@ async def segment_image_sam3d(request: SegmentSam3dRequest):
                     scores = [0.95] * len(masks)
                     
                 # Limit to requested number of masks
+                print(f"  Before filtering: {len(masks)} masks, multimask_output={request.multimask_output}")
                 if not request.multimask_output and len(masks) > 1:
                     best_idx = np.argmax(scores) if len(scores) > 0 else 0
+                    print(f"  Selecting best mask: index {best_idx}, score {scores[best_idx] if best_idx < len(scores) else 'N/A'}")
                     masks = masks[best_idx:best_idx+1]
                     scores = [scores[best_idx]] if len(scores) > best_idx else [0.95]
+                    print(f"  After filtering: {len(masks)} masks")
                 
+                print(f"  Processing {len(masks)} masks...")
                 for i in range(len(masks)):
-                    mask = masks[i]
-                    mask = (mask > request.mask_threshold).astype(np.uint8) * 255
+                    try:
+                        print(f"    Processing mask {i+1}/{len(masks)}...")
+                        mask = masks[i]
+                        print(f"      Mask shape: {mask.shape}, dtype: {mask.dtype}, min: {mask.min()}, max: {mask.max()}")
+                        
+                        # Ensure mask is in the right format
+                        if mask.dtype != np.float32 and mask.dtype != np.float64:
+                            mask = mask.astype(np.float32)
+                        
+                        mask = (mask > request.mask_threshold).astype(np.uint8) * 255
+                        print(f"      After threshold: shape={mask.shape}, dtype={mask.dtype}, unique values: {np.unique(mask)[:5]}")
 
-                    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-                    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
-                    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
-                    mask = cv2.GaussianBlur(mask, (5, 5), 0)
-                    mask = (mask > 127).astype(np.uint8) * 255
+                        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+                        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+                        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
+                        mask = cv2.GaussianBlur(mask, (5, 5), 0)
+                        mask = (mask > 127).astype(np.uint8) * 255
+                        print(f"      After morphology: shape={mask.shape}")
 
-                    if request.invert_mask:
-                        mask = 255 - mask
+                        if request.invert_mask:
+                            mask = 255 - mask
 
-                    mask_image = Image.fromarray(mask, mode="L")
-                    buffer = io.BytesIO()
-                    mask_image.save(buffer, format="PNG")
-                    buffer.seek(0)
-                    mask_base64 = base64.b64encode(buffer.getvalue()).decode("utf-8")
-                    mask_list.append({
-                        "mask": mask_base64,
-                        "mask_shape": list(mask.shape),
-                        "score": float(scores[i]) if i < len(scores) else 0.95,
-                    })
+                        mask_image = Image.fromarray(mask, mode="L")
+                        print(f"      Created PIL image: size={mask_image.size}, mode={mask_image.mode}")
+                        
+                        buffer = io.BytesIO()
+                        mask_image.save(buffer, format="PNG")
+                        buffer.seek(0)
+                        mask_base64 = base64.b64encode(buffer.getvalue()).decode("utf-8")
+                        print(f"      Encoded to base64: length={len(mask_base64)}")
+                        
+                        mask_list.append({
+                            "mask": mask_base64,
+                            "mask_shape": list(mask.shape),
+                            "score": float(scores[i]) if i < len(scores) else 0.95,
+                        })
+                        print(f"      ✓ Mask {i+1} processed successfully")
+                    except Exception as e:
+                        import traceback
+                        error_trace = traceback.format_exc()
+                        print(f"      ✗ Error processing mask {i+1}: {error_trace}")
+                        raise
             else:
                 # Sam3Processor failed, fall through to direct model API
                 print(f"Sam3Processor didn't return masks, trying direct model API...")
