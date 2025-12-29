@@ -513,7 +513,17 @@ async def segment_image(request: SegmentRequest):
         )
 
     except Exception as e:
-        return JSONResponse(status_code=400, content={"error": str(e)})
+        import traceback
+        error_trace = traceback.format_exc()
+        print(f"✗ Error in segment_image_sam3d: {error_trace}")
+        return JSONResponse(
+            status_code=500,
+            content={
+                "error": str(e),
+                "trace": error_trace,
+                "message": "An error occurred while processing the segmentation request."
+            }
+        )
 
 
 # ============================================================================
@@ -627,9 +637,13 @@ async def segment_image_sam3d(request: SegmentSam3dRequest):
                 if "masks" in inference_state:
                     masks = inference_state["masks"]
                     scores = inference_state.get("scores", None)
+                    boxes = inference_state.get("boxes", None)
                     print(f"✓ Got {len(masks)} masks from Sam3Processor")
+                    print(f"  Masks type: {type(masks)}, Scores type: {type(scores)}")
+                    if isinstance(masks, (list, tuple)) and len(masks) > 0:
+                        print(f"  First mask type: {type(masks[0])}, shape: {getattr(masks[0], 'shape', 'N/A') if hasattr(masks[0], 'shape') else 'N/A'}")
                 else:
-                    print(f"⚠ No masks in inference_state")
+                    print(f"⚠ No masks in inference_state, keys: {list(inference_state.keys())}")
                     masks = None
                     scores = None
                     
@@ -643,31 +657,53 @@ async def segment_image_sam3d(request: SegmentSam3dRequest):
                 scores = None
                 
             if masks is not None:
-                # Process masks from Sam3Processor
-                # masks shape: [num_masks, H, W] or list of tensors
-                if isinstance(masks, torch.Tensor):
-                    # Convert BFloat16 or other types to float32 first
-                    masks = masks.float().cpu().numpy()
-                elif isinstance(masks, list):
-                    # If masks is a list of tensors, convert each one
-                    masks_list = []
-                    for m in masks:
-                        if isinstance(m, torch.Tensor):
-                            masks_list.append(m.float().cpu().numpy())
-                        elif isinstance(m, (list, tuple)) and len(m) > 0:
-                            # Handle nested structure like [[tensor]]
-                            if isinstance(m[0], torch.Tensor):
-                                masks_list.append(m[0].float().cpu().numpy())
+                try:
+                    # Process masks from Sam3Processor
+                    # masks shape: [num_masks, H, W] or list of tensors
+                    print(f"Processing masks, type: {type(masks)}")
+                    if isinstance(masks, torch.Tensor):
+                        # Convert BFloat16 or other types to float32 first
+                        print(f"  Masks is Tensor, shape: {masks.shape}")
+                        masks = masks.float().cpu().numpy()
+                    elif isinstance(masks, list):
+                        # If masks is a list of tensors, convert each one
+                        print(f"  Masks is list, length: {len(masks)}")
+                        masks_list = []
+                        for i, m in enumerate(masks):
+                            print(f"    Mask {i}: type={type(m)}")
+                            if isinstance(m, torch.Tensor):
+                                print(f"      Tensor shape: {m.shape}")
+                                masks_list.append(m.float().cpu().numpy())
+                            elif isinstance(m, (list, tuple)) and len(m) > 0:
+                                # Handle nested structure like [[tensor]]
+                                if isinstance(m[0], torch.Tensor):
+                                    print(f"      Nested tensor shape: {m[0].shape}")
+                                    masks_list.append(m[0].float().cpu().numpy())
+                                else:
+                                    masks_list.append(np.array(m))
                             else:
                                 masks_list.append(np.array(m))
-                        else:
-                            masks_list.append(np.array(m))
-                    # Convert list to array if needed
-                    if len(masks_list) > 0:
-                        masks = np.stack(masks_list)
-                masks = np.squeeze(masks)
-                if masks.ndim == 2:
-                    masks = masks[np.newaxis, ...]
+                        # Convert list to array if needed
+                        if len(masks_list) > 0:
+                            print(f"  Stacking {len(masks_list)} masks")
+                            masks = np.stack(masks_list)
+                            print(f"  Stacked shape: {masks.shape}")
+                    masks = np.squeeze(masks)
+                    print(f"  After squeeze, shape: {masks.shape}, ndim: {masks.ndim}")
+                    if masks.ndim == 2:
+                        masks = masks[np.newaxis, ...]
+                        print(f"  Added dimension, new shape: {masks.shape}")
+                except Exception as e:
+                    import traceback
+                    error_trace = traceback.format_exc()
+                    print(f"✗ Error processing masks: {error_trace}")
+                    return JSONResponse(
+                        status_code=500,
+                        content={
+                            "error": f"Error processing masks: {str(e)}",
+                            "trace": error_trace
+                        }
+                    )
                     
                 if scores is None:
                     scores = [0.95] * len(masks)
