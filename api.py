@@ -2880,9 +2880,23 @@ async def video_propagate(request: VideoPropagateRequest):
                 frame_idx = response.get("frame_index", response.get("frame_idx", frames_processed))
                 outputs = response.get("outputs", {})
                 
+                # Skip metadata keys that are not object masks
+                metadata_keys = {"out_obj_ids", "out_probs", "out_boxes_xywh", "obj_ids", "probs", "boxes"}
+                
                 # Process outputs for each object
                 for obj_id, obj_output in outputs.items():
-                    obj_id_str = str(obj_id)
+                    # Skip metadata entries
+                    if obj_id in metadata_keys:
+                        continue
+                    
+                    # Validate obj_id is an integer (object IDs are numeric)
+                    try:
+                        obj_id_int = int(obj_id)
+                    except (ValueError, TypeError):
+                        # Skip non-numeric keys (they are metadata, not object IDs)
+                        continue
+                    
+                    obj_id_str = str(obj_id_int)
                     if obj_id_str not in masks_by_object:
                         masks_by_object[obj_id_str] = {}
                         scores_by_object[obj_id_str] = {}
@@ -2898,13 +2912,25 @@ async def video_propagate(request: VideoPropagateRequest):
                         mask = obj_output.get("mask", obj_output.get("video_res_mask"))
                         score = obj_output.get("score", obj_output.get("obj_score", 1.0))
                     elif isinstance(obj_output, np.ndarray):
+                        # Skip if it's not a valid mask (e.g., empty array or wrong shape)
+                        if obj_output.size == 0 or obj_output.ndim < 2:
+                            continue
                         mask = obj_output
                     elif isinstance(obj_output, torch.Tensor):
+                        if obj_output.numel() == 0:
+                            continue
                         mask = obj_output.cpu().numpy()
+                    else:
+                        # Unknown type, skip
+                        continue
                     
-                    if mask is not None:
+                    if mask is not None and mask.size > 0:
                         if isinstance(mask, torch.Tensor):
                             mask = mask.cpu().numpy()
+                        
+                        # Skip invalid masks
+                        if mask.size == 0 or mask.ndim < 2:
+                            continue
                         
                         # Ensure mask is 2D (height, width)
                         # Mask can come as (1, H, W), (H, W, 1), (1, 1, H, W), etc.
@@ -2913,9 +2939,15 @@ async def video_propagate(request: VideoPropagateRequest):
                                 mask = mask[0]
                             elif mask.shape[-1] == 1:
                                 mask = mask[..., 0]
-                            else:
+                            elif mask.shape[0] > 1:
                                 # Take first channel/batch
                                 mask = mask[0]
+                            else:
+                                break
+                        
+                        # Final check: must be 2D
+                        if mask.ndim != 2:
+                            continue
                         
                         # Convert to binary mask
                         mask = (mask > 0).astype(np.uint8) * 255
