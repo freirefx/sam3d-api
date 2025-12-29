@@ -843,6 +843,14 @@ async def segment_image_sam3d(request: SegmentSam3dRequest):
                                                     # Try calling without args (uses internal state/attributes)
                                                     try:
                                                         module._setup_rope_freqs()
+                                                        # Ensure freqs_cis is on the same device as the model
+                                                        if hasattr(module, 'freqs_cis') and module.freqs_cis is not None:
+                                                            current_device = next(sam3_model.parameters()).device
+                                                            if module.freqs_cis.device != current_device:
+                                                                module.freqs_cis = module.freqs_cis.to(device=current_device)
+                                                                print(f"    ✓ Moved freqs_cis from CPU to {current_device}")
+                                                            else:
+                                                                print(f"    ✓ freqs_cis already on {current_device}")
                                                         print(f"    ✓ Called _setup_rope_freqs() successfully")
                                                     except Exception as e_call:
                                                         print(f"    _setup_rope_freqs() failed: {e_call}")
@@ -890,6 +898,20 @@ async def segment_image_sam3d(request: SegmentSam3dRequest):
                                         print(f"    Could not update freqs_cis in {name}: {e}")
                 except Exception as e:
                     print(f"Warning: Could not update freqs_cis: {e}")
+                
+                # Final verification: ensure all freqs_cis are on the correct device
+                try:
+                    current_device = next(sam3_model.parameters()).device
+                    if hasattr(sam3_model, 'backbone') and hasattr(sam3_model.backbone, 'vision_backbone'):
+                        vision = sam3_model.backbone.vision_backbone
+                        if hasattr(vision, 'trunk'):
+                            for name, module in vision.trunk.named_modules():
+                                if hasattr(module, 'freqs_cis') and module.freqs_cis is not None:
+                                    if module.freqs_cis.device != current_device:
+                                        module.freqs_cis = module.freqs_cis.to(device=current_device)
+                                        print(f"Final fix: Moved {name}.freqs_cis to {current_device}")
+                except Exception as e:
+                    print(f"Warning: Final freqs_cis device check failed: {e}")
                 
                 with torch.no_grad():
                     print(f"Calling sam3_model.forward with BatchedDatapoint...")
