@@ -676,7 +676,8 @@ async def segment_image_sam3d(request: SegmentSam3dRequest):
                 print(f"Sam3Processor didn't return masks, trying direct model API...")
         
         # Use direct model API if Sam3Processor failed or doesn't have set_image
-        if not mask_list and (hasattr(sam3_model, 'forward') and (sam3_processor is sam3_model or not hasattr(sam3_processor, 'set_image'))):
+        # Always try direct model API if mask_list is empty and model has forward method
+        if not mask_list and hasattr(sam3_model, 'forward'):
             # Direct model API (no separate predictor)
             # SAM3 uses BatchedDatapoint interface with specific structure
             try:
