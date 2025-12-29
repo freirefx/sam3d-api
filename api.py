@@ -713,29 +713,72 @@ async def segment_image_sam3d(request: SegmentSam3dRequest):
                 )
                 print(f"✓ FindStage created successfully")
                 
-                # Create BatchedFindTarget (likely empty for segmentation)
+                # Create BatchedFindTarget and BatchedInferenceMetadata
+                # These might be optional or need specific parameters
+                find_target = None
+                metadata = None
+                
                 try:
-                    find_target = BatchedFindTarget()
+                    import inspect
+                    # Check if BatchedFindTarget can be created empty
+                    try:
+                        target_sig = inspect.signature(BatchedFindTarget.__init__)
+                        print(f"BatchedFindTarget signature: {target_sig}")
+                        # Try creating with no args
+                        find_target = BatchedFindTarget()
+                        print(f"✓ BatchedFindTarget created (empty)")
+                    except TypeError as te:
+                        print(f"⚠ BatchedFindTarget requires parameters: {te}")
+                        # Try with empty tensors if needed
+                        find_target = None
                 except Exception as e:
                     print(f"⚠ BatchedFindTarget creation failed: {e}, using None")
                     find_target = None
                 
-                # Create BatchedInferenceMetadata
                 try:
-                    metadata = BatchedInferenceMetadata()
+                    import inspect
+                    # Check if BatchedInferenceMetadata can be created empty
+                    try:
+                        metadata_sig = inspect.signature(BatchedInferenceMetadata.__init__)
+                        print(f"BatchedInferenceMetadata signature: {metadata_sig}")
+                        # Try creating with no args
+                        metadata = BatchedInferenceMetadata()
+                        print(f"✓ BatchedInferenceMetadata created (empty)")
+                    except TypeError as te:
+                        print(f"⚠ BatchedInferenceMetadata requires parameters: {te}")
+                        metadata = None
                 except Exception as e:
                     print(f"⚠ BatchedInferenceMetadata creation failed: {e}, using None")
                     metadata = None
                 
                 # Create BatchedDatapoint with correct structure
-                batched_datapoint = BatchedDatapoint(
-                    img_batch=image_tensor,
-                    find_text_batch=[],  # Empty list for no text prompts
-                    find_inputs=[find_stage],
-                    find_targets=[find_target] if find_target else [],
-                    find_metadatas=[metadata] if metadata else [],
-                    raw_images=[image_pil],  # Original PIL image
-                )
+                # Try with and without targets/metadatas
+                try:
+                    batched_datapoint = BatchedDatapoint(
+                        img_batch=image_tensor,
+                        find_text_batch=[],  # Empty list for no text prompts
+                        find_inputs=[find_stage],
+                        find_targets=[find_target] if find_target else [],
+                        find_metadatas=[metadata] if metadata else [],
+                        raw_images=[image_pil],  # Original PIL image
+                    )
+                    print(f"✓ BatchedDatapoint created successfully")
+                except Exception as e:
+                    print(f"⚠ BatchedDatapoint creation failed with targets/metadatas: {e}")
+                    # Try without targets/metadatas
+                    try:
+                        batched_datapoint = BatchedDatapoint(
+                            img_batch=image_tensor,
+                            find_text_batch=[],
+                            find_inputs=[find_stage],
+                            find_targets=[],
+                            find_metadatas=[],
+                            raw_images=[image_pil],
+                        )
+                        print(f"✓ BatchedDatapoint created without targets/metadatas")
+                    except Exception as e2:
+                        print(f"✗ BatchedDatapoint creation failed completely: {e2}")
+                        raise e2
                 print(f"✓ BatchedDatapoint created successfully")
                 
                 with torch.no_grad():
