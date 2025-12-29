@@ -644,9 +644,27 @@ async def segment_image_sam3d(request: SegmentSam3dRequest):
                 
             if masks is not None:
                 # Process masks from Sam3Processor
-                # masks shape: [num_masks, H, W]
+                # masks shape: [num_masks, H, W] or list of tensors
                 if isinstance(masks, torch.Tensor):
-                    masks = masks.cpu().numpy()
+                    # Convert BFloat16 or other types to float32 first
+                    masks = masks.float().cpu().numpy()
+                elif isinstance(masks, list):
+                    # If masks is a list of tensors, convert each one
+                    masks_list = []
+                    for m in masks:
+                        if isinstance(m, torch.Tensor):
+                            masks_list.append(m.float().cpu().numpy())
+                        elif isinstance(m, (list, tuple)) and len(m) > 0:
+                            # Handle nested structure like [[tensor]]
+                            if isinstance(m[0], torch.Tensor):
+                                masks_list.append(m[0].float().cpu().numpy())
+                            else:
+                                masks_list.append(np.array(m))
+                        else:
+                            masks_list.append(np.array(m))
+                    # Convert list to array if needed
+                    if len(masks_list) > 0:
+                        masks = np.stack(masks_list)
                 masks = np.squeeze(masks)
                 if masks.ndim == 2:
                     masks = masks[np.newaxis, ...]
@@ -654,7 +672,8 @@ async def segment_image_sam3d(request: SegmentSam3dRequest):
                 if scores is None:
                     scores = [0.95] * len(masks)
                 elif isinstance(scores, torch.Tensor):
-                    scores = scores.cpu().numpy().flatten().tolist()
+                    # Convert BFloat16 or other types to float32 first
+                    scores = scores.float().cpu().numpy().flatten().tolist()
                 elif not isinstance(scores, (list, tuple)):
                     scores = [0.95] * len(masks)
                     
