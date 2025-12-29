@@ -693,27 +693,41 @@ async def segment_image_sam3d(request: SegmentSam3dRequest):
                 new_w = None
                 
                 # Try to detect expected size from model's freqs_cis
+                # SAM3 has multiple blocks with different freqs_cis sizes
+                # We need to find ALL sizes and use the smallest one (or update all)
+                detected_sizes = []
                 try:
                     if hasattr(sam3_model, 'backbone') and hasattr(sam3_model.backbone, 'vision_backbone'):
                         vision = sam3_model.backbone.vision_backbone
                         if hasattr(vision, 'trunk'):
-                            # Find first block with freqs_cis to get expected sequence length
+                            patch_size = 16
+                            # Find ALL blocks with freqs_cis to get all expected sequence lengths
                             for name, module in vision.trunk.named_modules():
                                 if hasattr(module, 'freqs_cis') and module.freqs_cis is not None:
                                     freqs_shape = module.freqs_cis.shape
                                     if len(freqs_shape) >= 1:
                                         expected_seq_len = freqs_shape[0]
                                         # Calculate image size: seq_len = (H/patch_size) * (W/patch_size)
-                                        # For SAM3, patch_size is typically 16
-                                        patch_size = 16
                                         # Assuming square images: seq_len = (size/16)^2
-                                        expected_size = int((expected_seq_len * patch_size * patch_size) ** 0.5)
+                                        calculated_size = int((expected_seq_len * patch_size * patch_size) ** 0.5)
                                         # Round to nearest multiple of patch_size
-                                        expected_size = (expected_size // patch_size) * patch_size
-                                        print(f"Detected expected image size from freqs_cis: {expected_size}x{expected_size} (seq_len={expected_seq_len})")
-                                        break
+                                        calculated_size = (calculated_size // patch_size) * patch_size
+                                        detected_sizes.append((name, expected_seq_len, calculated_size))
+                            
+                            if detected_sizes:
+                                # Use the smallest size to ensure compatibility with all blocks
+                                detected_sizes.sort(key=lambda x: x[1])  # Sort by seq_len
+                                smallest = detected_sizes[0]
+                                expected_size = smallest[2]
+                                print(f"Detected {len(detected_sizes)} different freqs_cis sizes:")
+                                for name, seq_len, size in detected_sizes[:5]:  # Show first 5
+                                    print(f"  {name}: seq_len={seq_len}, size={size}x{size}")
+                                print(f"Using smallest size: {expected_size}x{expected_size} (seq_len={smallest[1]}) for compatibility")
+                            else:
+                                expected_size = None
                 except Exception as e:
                     print(f"Could not detect expected size: {e}")
+                    expected_size = None
                 
                 # Default to common SAM3 sizes if detection failed
                 if expected_size is None:
@@ -862,7 +876,73 @@ async def segment_image_sam3d(request: SegmentSam3dRequest):
                     except Exception as e2:
                         print(f"✗ BatchedDatapoint creation failed completely: {e2}")
                         raise e2
-                print(f"✓ BatchedDatapoint created successfully")
+                
+                # Before calling forward, update freqs_cis for the actual image size
+                # Calculate actual sequence dimensions
+                patch_size = 16
+                H_p = h // patch_size
+                W_p = w // patch_size
+                actual_seq_len = H_p * W_p
+                
+                print(f"Updating freqs_cis for image size {h}x{w} (patches: {H_p}x{W_p}, seq_len={actual_seq_len})")
+                
+                try:
+                    if hasattr(sam3_model, 'backbone') and hasattr(sam3_model.backbone, 'vision_backbone'):
+                        vision = sam3_model.backbone.vision_backbone
+                        if hasattr(vision, 'trunk'):
+                            # Try to update freqs_cis in all attention modules
+                            updated_count = 0
+                            for name, module in vision.trunk.named_modules():
+                                if hasattr(module, 'freqs_cis') and hasattr(module, 'head_dim'):
+                                    try:
+                                        current_freqs = module.freqs_cis
+                                        if current_freqs is not None and current_freqs.shape[0] != actual_seq_len:
+                                            # Try to compute new freqs_cis
+                                            try:
+                                                from sam3.model.vitdet import compute_axial_cis
+                                                head_dim = module.head_dim
+                                                rope_theta = getattr(module, 'rope_theta', 10000.0)
+                                                
+                                                new_freqs = compute_axial_cis(
+                                                    end_x=H_p,
+                                                    end_y=W_p,
+                                                    dim=head_dim,
+                                                    theta=rope_theta,
+                                                )
+                                                # Move to correct device and dtype
+                                                current_device = next(sam3_model.parameters()).device
+                                                new_freqs = new_freqs.to(device=current_device, dtype=current_freqs.dtype)
+                                                module.freqs_cis = new_freqs
+                                                updated_count += 1
+                                                print(f"  ✓ Updated freqs_cis in {name}: {current_freqs.shape[0]} -> {actual_seq_len}")
+                                            except ImportError:
+                                                # Try alternative import path
+                                                try:
+                                                    from sam3.sam3.model.vitdet import compute_axial_cis
+                                                    head_dim = module.head_dim
+                                                    rope_theta = getattr(module, 'rope_theta', 10000.0)
+                                                    new_freqs = compute_axial_cis(
+                                                        end_x=H_p,
+                                                        end_y=W_p,
+                                                        dim=head_dim,
+                                                        theta=rope_theta,
+                                                    ).to(device=current_device, dtype=current_freqs.dtype)
+                                                    module.freqs_cis = new_freqs
+                                                    updated_count += 1
+                                                    print(f"  ✓ Updated freqs_cis in {name} (alt import)")
+                                                except Exception as e2:
+                                                    print(f"  ⚠ Could not update {name}: {e2}")
+                                            except Exception as e:
+                                                print(f"  ⚠ Error updating {name}: {e}")
+                                    except Exception as e:
+                                        pass
+                            
+                            if updated_count > 0:
+                                print(f"✓ Updated {updated_count} freqs_cis modules")
+                            else:
+                                print(f"⚠ No freqs_cis modules were updated")
+                except Exception as e:
+                    print(f"⚠ Warning: Could not update freqs_cis: {e}")
                 
                 with torch.no_grad():
                     print(f"Calling sam3_model.forward with BatchedDatapoint...")
