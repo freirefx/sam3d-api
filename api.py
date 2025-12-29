@@ -828,21 +828,64 @@ async def segment_image_sam3d(request: SegmentSam3dRequest):
                                         if current_freqs.shape[0] != expected_seq_len:
                                             print(f"  Updating freqs_cis in {name}: {current_freqs.shape[0]} -> {expected_seq_len}")
                                             # Try to use the model's own method if available
-                                            if hasattr(module, '_setup_rope_freqs'):
-                                                module._setup_rope_freqs(H_p, W_p)
-                                            elif hasattr(module, 'rope_theta'):
-                                                # Try to recompute using rope_theta
-                                                # This is a simplified version - may need full implementation
-                                                head_dim = module.head_dim
-                                                rope_theta = getattr(module, 'rope_theta', 10000.0)
-                                                
-                                                # Create new freqs_cis (simplified - may need proper axial computation)
-                                                # For now, just try to use existing if shape is close
-                                                if abs(current_freqs.shape[0] - expected_seq_len) < expected_seq_len * 0.5:
-                                                    # Shape is close, try to interpolate or use as-is
-                                                    print(f"    Shape close enough, using existing")
+                                            try:
+                                                import inspect
+                                                if hasattr(module, '_setup_rope_freqs'):
+                                                    sig = inspect.signature(module._setup_rope_freqs)
+                                                    print(f"    _setup_rope_freqs signature: {sig}")
+                                                    
+                                                    # Try setting attributes first, then calling
+                                                    if hasattr(module, 'rope_pt_size'):
+                                                        # Set the patch size first
+                                                        module.rope_pt_size = (H_p, W_p)
+                                                        print(f"    Set rope_pt_size to ({H_p}, {W_p})")
+                                                    
+                                                    # Try calling without args (uses internal state/attributes)
+                                                    try:
+                                                        module._setup_rope_freqs()
+                                                        print(f"    ✓ Called _setup_rope_freqs() successfully")
+                                                    except Exception as e_call:
+                                                        print(f"    _setup_rope_freqs() failed: {e_call}")
+                                                        # Try alternative: manually compute and set freqs_cis
+                                                        try:
+                                                            # Try to import the compute function from SAM3
+                                                            from sam3.model.vitdet import compute_axial_cis
+                                                            head_dim = module.head_dim
+                                                            rope_theta = getattr(module, 'rope_theta', 10000.0)
+                                                            
+                                                            # Compute new freqs_cis
+                                                            new_freqs = compute_axial_cis(
+                                                                end_x=H_p,
+                                                                end_y=W_p,
+                                                                dim=head_dim,
+                                                                theta=rope_theta,
+                                                            ).to(device=device, dtype=torch.float32)
+                                                            
+                                                            module.freqs_cis = new_freqs
+                                                            print(f"    ✓ Manually computed and set freqs_cis")
+                                                        except ImportError as ie:
+                                                            print(f"    Cannot import compute_axial_cis: {ie}")
+                                                            # Try to find it in a different location
+                                                            try:
+                                                                from sam3.sam3.model.vitdet import compute_axial_cis
+                                                                head_dim = module.head_dim
+                                                                rope_theta = getattr(module, 'rope_theta', 10000.0)
+                                                                new_freqs = compute_axial_cis(
+                                                                    end_x=H_p,
+                                                                    end_y=W_p,
+                                                                    dim=head_dim,
+                                                                    theta=rope_theta,
+                                                                ).to(device=device, dtype=torch.float32)
+                                                                module.freqs_cis = new_freqs
+                                                                print(f"    ✓ Found compute_axial_cis in alternative location")
+                                                            except:
+                                                                print(f"    Could not find compute_axial_cis function")
+                                                        except Exception as e2:
+                                                            print(f"    Could not manually compute freqs_cis: {e2}")
                                                 else:
-                                                    print(f"    Cannot automatically update freqs_cis - size mismatch too large")
+                                                    print(f"    No _setup_rope_freqs method available")
+                                            except Exception as e:
+                                                print(f"    Error in freqs_cis update: {e}")
                                     except Exception as e:
                                         print(f"    Could not update freqs_cis in {name}: {e}")
                 except Exception as e:
