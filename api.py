@@ -588,18 +588,87 @@ async def segment_image_sam3d(request: SegmentSam3dRequest):
         mask_list = []
 
         if hasattr(sam3_processor, 'set_image'):
-            # SAM3ImagePredictor API (local installation with predictor)
-            sam3_processor.set_image(image_np)
-
-            with torch.no_grad():
-                masks, scores, logits = sam3_processor.predict(
-                    point_coords=point_coords,
-                    point_labels=point_labels,
-                    multimask_output=request.multimask_output,
-                )
-
-            # masks shape: [num_masks, H, W]
-            for i in range(masks.shape[0]):
+            # Sam3Processor API - uses set_image() which returns inference_state
+            # Then use set_text_prompt() or other methods for prompts
+            try:
+                # Check available methods
+                processor_methods = [m for m in dir(sam3_processor) if not m.startswith('_') and callable(getattr(sam3_processor, m))]
+                print(f"Sam3Processor methods: {processor_methods}")
+                
+                # set_image returns inference_state
+                inference_state = sam3_processor.set_image(image_pil)
+                print(f"✓ Image set, inference_state type: {type(inference_state)}")
+                
+                # Try to find method for point prompts
+                # Sam3Processor might use set_point_prompt, set_prompt, or similar
+                if hasattr(sam3_processor, 'set_point_prompt'):
+                    output = sam3_processor.set_point_prompt(
+                        state=inference_state,
+                        point_coords=point_coords,
+                        point_labels=point_labels,
+                    )
+                elif hasattr(sam3_processor, 'set_prompt'):
+                    output = sam3_processor.set_prompt(
+                        state=inference_state,
+                        point_coords=point_coords,
+                        point_labels=point_labels,
+                    )
+                elif hasattr(sam3_processor, 'predict'):
+                    # Fallback to predict if available
+                    with torch.no_grad():
+                        masks, scores, logits = sam3_processor.predict(
+                            point_coords=point_coords,
+                            point_labels=point_labels,
+                            multimask_output=request.multimask_output,
+                        )
+                    output = {"masks": masks, "scores": scores}
+                else:
+                    # Try calling with inference_state directly
+                    raise AttributeError("Sam3Processor doesn't have point prompt methods. Available methods: " + str(processor_methods))
+                
+                # Extract masks from output
+                if isinstance(output, dict):
+                    masks = output.get("masks", None)
+                    scores = output.get("scores", output.get("iou_scores", None))
+                elif hasattr(output, 'masks'):
+                    masks = output.masks
+                    scores = getattr(output, 'scores', None)
+                else:
+                    masks = output
+                    scores = None
+                    
+            except Exception as e:
+                import traceback
+                error_trace = traceback.format_exc()
+                print(f"✗ Sam3Processor API error: {error_trace}")
+                print(f"  Falling back to direct model API (BatchedDatapoint)")
+                # Fall back to direct model API - will be handled in elif block below
+                masks = None
+                scores = None
+                
+            if masks is not None:
+                # Process masks from Sam3Processor
+                # masks shape: [num_masks, H, W]
+                if isinstance(masks, torch.Tensor):
+                    masks = masks.cpu().numpy()
+                masks = np.squeeze(masks)
+                if masks.ndim == 2:
+                    masks = masks[np.newaxis, ...]
+                    
+                if scores is None:
+                    scores = [0.95] * len(masks)
+                elif isinstance(scores, torch.Tensor):
+                    scores = scores.cpu().numpy().flatten().tolist()
+                elif not isinstance(scores, (list, tuple)):
+                    scores = [0.95] * len(masks)
+                    
+                # Limit to requested number of masks
+                if not request.multimask_output and len(masks) > 1:
+                    best_idx = np.argmax(scores) if len(scores) > 0 else 0
+                    masks = masks[best_idx:best_idx+1]
+                    scores = [scores[best_idx]] if len(scores) > best_idx else [0.95]
+                
+                for i in range(len(masks)):
                 mask = masks[i]
                 mask = (mask > request.mask_threshold).astype(np.uint8) * 255
 
@@ -617,13 +686,17 @@ async def segment_image_sam3d(request: SegmentSam3dRequest):
                 mask_image.save(buffer, format="PNG")
                 buffer.seek(0)
                 mask_base64 = base64.b64encode(buffer.getvalue()).decode("utf-8")
-                mask_list.append({
-                    "mask": mask_base64,
-                    "mask_shape": list(mask.shape),
-                    "score": float(scores[i]) if i < len(scores) else 0.95,
-                })
-
-        elif hasattr(sam3_model, 'forward') and sam3_processor is sam3_model:
+                    mask_list.append({
+                        "mask": mask_base64,
+                        "mask_shape": list(mask.shape),
+                        "score": float(scores[i]) if i < len(scores) else 0.95,
+                    })
+            else:
+                # Sam3Processor failed, fall through to direct model API
+                print(f"Sam3Processor didn't return masks, trying direct model API...")
+        
+        # Use direct model API if Sam3Processor failed or doesn't have set_image
+        if not mask_list and (hasattr(sam3_model, 'forward') and (sam3_processor is sam3_model or not hasattr(sam3_processor, 'set_image'))):
             # Direct model API (no separate predictor)
             # SAM3 uses BatchedDatapoint interface with specific structure
             try:
