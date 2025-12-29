@@ -300,7 +300,15 @@ def initialize_sam3_model():
                                 print(f"  Detected {len(detected_sizes)} different freqs_cis sizes:")
                                 for seq_len, size, name in detected_sizes[:5]:  # Show first 5
                                     print(f"    {name}: seq_len={seq_len}, size={size}x{size}")
+                                
+                                # Find smallest size for compatibility
+                                smallest = min(detected_sizes, key=lambda x: x[0])
+                                print(f"  Using smallest: {smallest[1]}x{smallest[1]} (seq_len={smallest[0]}) for compatibility")
                                 print(f"  Using largest: {largest[1]}x{largest[1]} (seq_len={largest[0]})")
+                                
+                                # Store both sizes
+                                sam3_model._estimated_image_size = largest[1]  # For reference
+                                sam3_model._smallest_detected_size = smallest[1]  # For actual use
                 except Exception as e:
                     print(f"  Could not detect expected size: {e}")
                 
@@ -690,9 +698,18 @@ async def segment_image_sam3d(request: SegmentSam3dRequest):
                     print(f"Estimated image size from seq_len: {estimated_size}x{estimated_size}")
                     # But this might not be correct if the model expects non-square images
                 
-                # Use detected size if available, otherwise try original size
+                # Use smallest detected size for compatibility with all blocks
+                smallest_size = getattr(sam3_model, '_smallest_detected_size', None)
                 estimated_size = getattr(sam3_model, '_estimated_image_size', None)
-                if estimated_size:
+                
+                if smallest_size:
+                    # Use smallest size to ensure all blocks can handle it
+                    target_size = (smallest_size, smallest_size)
+                    print(f"Using smallest detected image size: {target_size} (for compatibility with all blocks)")
+                    image_pil_resized = image_pil.resize(target_size, Image.Resampling.LANCZOS)
+                    image_np = np.array(image_pil_resized)
+                    h, w = smallest_size, smallest_size
+                elif estimated_size:
                     target_size = (estimated_size, estimated_size)
                     print(f"Using detected image size: {target_size}")
                     image_pil_resized = image_pil.resize(target_size, Image.Resampling.LANCZOS)
@@ -872,15 +889,29 @@ async def segment_image_sam3d(request: SegmentSam3dRequest):
                                                                     head_dim = module.head_dim
                                                                     rope_theta = getattr(module, 'rope_theta', 10000.0)
                                                                     
+                                                                    # Compute freqs_cis - it returns a complex tensor
                                                                     new_freqs = compute_axial_cis(
                                                                         end_x=H_p,
                                                                         end_y=W_p,
                                                                         dim=head_dim,
                                                                         theta=rope_theta,
-                                                                    ).to(device=current_device, dtype=torch.float32)
+                                                                    )
+                                                                    
+                                                                    # Check the original dtype of freqs_cis
+                                                                    original_dtype = module.freqs_cis.dtype if hasattr(module, 'freqs_cis') and module.freqs_cis is not None else torch.complex64
+                                                                    
+                                                                    # Move to device and convert to appropriate dtype
+                                                                    new_freqs = new_freqs.to(device=current_device)
+                                                                    # Keep complex dtype if that's what the module expects
+                                                                    if original_dtype.is_complex:
+                                                                        # Keep as complex
+                                                                        pass
+                                                                    else:
+                                                                        # Convert to real (this will discard imaginary part, but that's what we were doing)
+                                                                        new_freqs = new_freqs.to(dtype=original_dtype)
                                                                     
                                                                     module.freqs_cis = new_freqs
-                                                                    print(f"    ✓ Manually computed freqs_cis: {new_freqs.shape}")
+                                                                    print(f"    ✓ Manually computed freqs_cis: {new_freqs.shape}, dtype: {new_freqs.dtype}")
                                                                 except ImportError:
                                                                     try:
                                                                         from sam3.sam3.model.vitdet import compute_axial_cis
