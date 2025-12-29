@@ -629,29 +629,63 @@ async def segment_image_sam3d(request: SegmentSam3dRequest):
                 point_coords_normalized = torch.tensor([[[request.x / w, request.y / h]]], dtype=torch.float32, device=device)
                 point_labels_tensor = torch.tensor([[1]], dtype=torch.int64, device=device)
                 
-                # Create BatchedDatapoint
-                # Based on SAM3 structure, we need to create a proper datapoint
-                batched_datapoint = BatchedDatapoint(
-                    image=image_tensor,
-                    point_coords=point_coords_normalized,
-                    point_labels=point_labels_tensor,
-                )
+                # Check BatchedDatapoint structure
+                try:
+                    datapoint_sig = inspect.signature(BatchedDatapoint.__init__)
+                    print(f"BatchedDatapoint signature: {datapoint_sig}")
+                except:
+                    pass
+                
+                # Try to create BatchedDatapoint - check what fields it expects
+                try:
+                    # Try with named arguments first
+                    batched_datapoint = BatchedDatapoint(
+                        image=image_tensor,
+                        point_coords=point_coords_normalized,
+                        point_labels=point_labels_tensor,
+                    )
+                    print(f"✓ BatchedDatapoint created successfully")
+                except TypeError as te:
+                    # If that fails, try to see what fields are expected
+                    print(f"⚠ BatchedDatapoint creation failed: {te}")
+                    # Try to inspect the class
+                    if hasattr(BatchedDatapoint, '__annotations__'):
+                        print(f"BatchedDatapoint annotations: {BatchedDatapoint.__annotations__}")
+                    # Try creating with just image first
+                    try:
+                        batched_datapoint = BatchedDatapoint(image=image_tensor)
+                        # Then try to set attributes
+                        if hasattr(batched_datapoint, 'point_coords'):
+                            batched_datapoint.point_coords = point_coords_normalized
+                        if hasattr(batched_datapoint, 'point_labels'):
+                            batched_datapoint.point_labels = point_labels_tensor
+                        print(f"✓ BatchedDatapoint created with attribute assignment")
+                    except Exception as e2:
+                        print(f"⚠ Alternative creation failed: {e2}")
+                        raise te
                 
                 with torch.no_grad():
+                    print(f"Calling sam3_model.forward with BatchedDatapoint...")
                     outputs = sam3_model(batched_datapoint)
+                    print(f"✓ Model forward call successful, output type: {type(outputs)}")
                     
             except ImportError as e:
+                import traceback
+                error_trace = traceback.format_exc()
+                print(f"✗ Import error: {error_trace}")
                 return JSONResponse(
                     status_code=500,
                     content={
                         "error": f"SAM3 BatchedDatapoint import failed: {str(e)}",
-                        "message": "SAM3 model structure may have changed. Please check SAM3 documentation."
+                        "message": "SAM3 model structure may have changed. Please check SAM3 documentation.",
+                        "trace": error_trace
                     },
                 )
             except Exception as e:
                 # Fallback: try to understand the error and provide helpful message
                 import traceback
                 error_trace = traceback.format_exc()
+                print(f"✗ SAM3 forward error: {error_trace}")
                 return JSONResponse(
                     status_code=500,
                     content={
