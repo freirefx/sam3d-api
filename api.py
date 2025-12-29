@@ -621,11 +621,57 @@ async def segment_image_sam3d(request: SegmentSam3dRequest):
                 from torchvision.transforms import functional as TF
                 
                 # Prepare image tensor - SAM3 expects img_batch
-                image_tensor = TF.to_tensor(image_pil).unsqueeze(0).to(device)
+                # SAM3 may require specific image size - try to resize to a standard size
+                # SAM models typically use 1024 as max dimension, but may need specific aspect ratios
+                original_size = image_pil.size
+                original_w, original_h = original_size
                 
-                # Prepare point prompts - normalize coordinates to [0, 1]
-                h, w = image_np.shape[:2]
-                point_coords_normalized = torch.tensor([[[request.x / w, request.y / h]]], dtype=torch.float32, device=device)
+                # Try resizing to max 1024 while maintaining aspect ratio
+                # But ensure dimensions are multiples of patch size (often 16 or 32)
+                max_size = 1024
+                patch_size = 16  # Common patch size for vision transformers
+                
+                if max(original_size) > max_size:
+                    ratio = max_size / max(original_size)
+                    new_w = int(original_w * ratio)
+                    new_h = int(original_h * ratio)
+                    # Round to nearest multiple of patch_size
+                    new_w = (new_w // patch_size) * patch_size
+                    new_h = (new_h // patch_size) * patch_size
+                    image_pil_resized = image_pil.resize((new_w, new_h), Image.Resampling.LANCZOS)
+                    print(f"Resized image from {original_size} to ({new_w}, {new_h})")
+                    image_np = np.array(image_pil_resized)
+                    h, w = new_h, new_w
+                else:
+                    # Even if not resizing, ensure dimensions are multiples of patch_size
+                    new_w = (original_w // patch_size) * patch_size
+                    new_h = (original_h // patch_size) * patch_size
+                    if new_w != original_w or new_h != original_h:
+                        image_pil_resized = image_pil.resize((new_w, new_h), Image.Resampling.LANCZOS)
+                        print(f"Adjusted image size to patch_size multiple: ({new_w}, {new_h})")
+                        image_np = np.array(image_pil_resized)
+                        h, w = new_h, new_w
+                    else:
+                        image_pil_resized = image_pil
+                        h, w = original_h, original_w
+                
+                # Convert to tensor: [C, H, W] then add batch dimension: [1, C, H, W]
+                image_tensor = TF.to_tensor(image_pil_resized).unsqueeze(0).to(device)
+                print(f"Image tensor shape: {image_tensor.shape}, dtype: {image_tensor.dtype}")
+                
+                # Prepare point prompts - normalize coordinates to [0, 1] based on original image size
+                # Points are provided in original image coordinates, so we need to scale them
+                if max(original_size) > max_size:
+                    # Scale points to match resized image
+                    scale_x = w / original_w
+                    scale_y = h / original_h
+                    scaled_x = request.x * scale_x
+                    scaled_y = request.y * scale_y
+                else:
+                    scaled_x = request.x
+                    scaled_y = request.y
+                
+                point_coords_normalized = torch.tensor([[[scaled_x / w, scaled_y / h]]], dtype=torch.float32, device=device)
                 point_labels_tensor = torch.tensor([[1]], dtype=torch.int64, device=device)
                 
                 # Create FindStage for point prompts
@@ -1119,13 +1165,37 @@ async def segment_image_binary_sam3d(request: SegmentBinarySam3dRequest):
                 from sam3.model.data_misc import BatchedDatapoint, FindStage, BatchedFindTarget, BatchedInferenceMetadata
                 from torchvision.transforms import functional as TF
 
-                # Prepare image tensor
-                image_tensor = TF.to_tensor(image_pil).unsqueeze(0).to(device)
-                h, w = image_np.shape[:2]
+                # Prepare image tensor - resize if needed
+                original_size = image_pil.size
+                original_w, original_h = original_size
+                max_size = 1024
+                
+                if max(original_size) > max_size:
+                    ratio = max_size / max(original_size)
+                    new_w = int(original_w * ratio)
+                    new_h = int(original_h * ratio)
+                    image_pil_resized = image_pil.resize((new_w, new_h), Image.Resampling.LANCZOS)
+                    image_np = np.array(image_pil_resized)
+                    h, w = new_h, new_w
+                else:
+                    image_pil_resized = image_pil
+                    h, w = original_h, original_w
+                
+                image_tensor = TF.to_tensor(image_pil_resized).unsqueeze(0).to(device)
 
                 for point in request.points:
+                    # Scale points if image was resized
+                    if max(original_size) > max_size:
+                        scale_x = w / original_w
+                        scale_y = h / original_h
+                        scaled_x = point["x"] * scale_x
+                        scaled_y = point["y"] * scale_y
+                    else:
+                        scaled_x = point["x"]
+                        scaled_y = point["y"]
+                    
                     # Normalize coordinates to [0, 1]
-                    point_coords_normalized = torch.tensor([[[point["x"] / w, point["y"] / h]]], dtype=torch.float32, device=device)
+                    point_coords_normalized = torch.tensor([[[scaled_x / w, scaled_y / h]]], dtype=torch.float32, device=device)
                     point_labels_tensor = torch.tensor([[1]], dtype=torch.int64, device=device)
 
                     # Create FindStage for point prompts
