@@ -2759,13 +2759,26 @@ async def video_add_prompt(request: VideoAddPromptRequest):
         }
 
         # Add prompt data
+        # SAM3 video predictor requires "text" or "boxes" (plural)
         if request.text:
             prompt_request["text"] = request.text
         if request.point_coords:
+            # Points need to be passed as point_coords and point_labels
             prompt_request["point_coords"] = request.point_coords
             prompt_request["point_labels"] = request.point_labels or [1] * len(request.point_coords)
+            # If only points provided, we need to create a box from points as fallback
+            # because SAM3 video requires text or boxes
+            if not request.text and not request.box:
+                # Create bounding box from points with some padding
+                points = request.point_coords
+                if len(points) > 0:
+                    xs = [p[0] for p in points]
+                    ys = [p[1] for p in points]
+                    padding = 50  # pixels
+                    box = [min(xs) - padding, min(ys) - padding, max(xs) + padding, max(ys) + padding]
+                    prompt_request["boxes"] = [box]  # boxes is a list of boxes
         if request.box:
-            prompt_request["box"] = request.box
+            prompt_request["boxes"] = [request.box]  # boxes is a list of boxes
         if request.mask:
             try:
                 mask_data = base64.b64decode(request.mask)
@@ -2826,10 +2839,129 @@ class VideoPropagateRequest(BaseModel):
     max_frame: Optional[int] = None  # Maximum frame to propagate to
 
 
+# Storage for propagation tasks
+propagation_tasks = {}
+
+
+def run_propagation_sync(task_id: str, session_id: str, predictor_session_id: str, 
+                          start_frame: int, max_frame: Optional[int], session: dict):
+    """Run propagation synchronously in a background thread."""
+    try:
+        propagation_tasks[task_id]["status"] = "processing"
+        propagation_tasks[task_id]["progress"] = 0
+        
+        propagate_request = {
+            "type": "propagate_in_video",
+            "session_id": predictor_session_id,
+        }
+        if start_frame != 0:
+            propagate_request["start_frame"] = start_frame
+        if max_frame is not None:
+            propagate_request["max_frame"] = max_frame
+
+        masks_by_object = {}
+        scores_by_object = {}
+        frames_processed = 0
+        total_frames = session.get("num_frames", 0)
+        
+        # Skip metadata keys that are not object masks
+        metadata_keys = {"out_obj_ids", "out_probs", "out_boxes_xywh", "obj_ids", "probs", "boxes"}
+        
+        for response in sam3_video_predictor.handle_stream_request(request=propagate_request):
+            frame_idx = response.get("frame_index", response.get("frame_idx", frames_processed))
+            outputs = response.get("outputs", {})
+            
+            for obj_id, obj_output in outputs.items():
+                if obj_id in metadata_keys:
+                    continue
+                
+                try:
+                    obj_id_int = int(obj_id)
+                except (ValueError, TypeError):
+                    continue
+                
+                obj_id_str = str(obj_id_int)
+                if obj_id_str not in masks_by_object:
+                    masks_by_object[obj_id_str] = {}
+                    scores_by_object[obj_id_str] = {}
+                
+                mask = None
+                score = 1.0
+                
+                if isinstance(obj_output, dict):
+                    mask = obj_output.get("mask", obj_output.get("video_res_mask"))
+                    score = obj_output.get("score", obj_output.get("obj_score", 1.0))
+                elif isinstance(obj_output, np.ndarray):
+                    if obj_output.size == 0 or obj_output.ndim < 2:
+                        continue
+                    mask = obj_output
+                elif isinstance(obj_output, torch.Tensor):
+                    if obj_output.numel() == 0:
+                        continue
+                    mask = obj_output.cpu().numpy()
+                else:
+                    continue
+                
+                if mask is not None and mask.size > 0:
+                    if isinstance(mask, torch.Tensor):
+                        mask = mask.cpu().numpy()
+                    
+                    if mask.size == 0 or mask.ndim < 2:
+                        continue
+                    
+                    while mask.ndim > 2:
+                        if mask.shape[0] == 1:
+                            mask = mask[0]
+                        elif mask.shape[-1] == 1:
+                            mask = mask[..., 0]
+                        elif mask.shape[0] > 1:
+                            mask = mask[0]
+                        else:
+                            break
+                    
+                    if mask.ndim != 2:
+                        continue
+                    
+                    mask = (mask > 0).astype(np.uint8) * 255
+                    
+                    try:
+                        mask_image = Image.fromarray(mask, mode="L")
+                        buffer = io.BytesIO()
+                        mask_image.save(buffer, format="PNG")
+                        buffer.seek(0)
+                        masks_by_object[obj_id_str][str(frame_idx)] = base64.b64encode(buffer.getvalue()).decode("utf-8")
+                    except Exception:
+                        continue
+                
+                if isinstance(score, torch.Tensor):
+                    score = score.item()
+                scores_by_object[obj_id_str][str(frame_idx)] = float(score)
+            
+            frames_processed += 1
+            if total_frames > 0:
+                propagation_tasks[task_id]["progress"] = frames_processed / total_frames
+                propagation_tasks[task_id]["frames_processed"] = frames_processed
+
+        # Store masks in session
+        session["propagated_masks"] = masks_by_object
+        session["propagated_scores"] = scores_by_object
+        
+        propagation_tasks[task_id]["status"] = "completed"
+        propagation_tasks[task_id]["progress"] = 1.0
+        propagation_tasks[task_id]["frames_processed"] = frames_processed
+        propagation_tasks[task_id]["objects_tracked"] = list(masks_by_object.keys())
+        
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        propagation_tasks[task_id]["status"] = "failed"
+        propagation_tasks[task_id]["error"] = str(e)
+
+
 @app.post("/video/propagate")
-async def video_propagate(request: VideoPropagateRequest):
+async def video_propagate(request: VideoPropagateRequest, background_tasks: BackgroundTasks):
     """
-    Propagate segmentation masks through the video.
+    Start propagation of segmentation masks through the video (async with polling).
 
     Args:
         request: JSON body containing:
@@ -2839,9 +2971,8 @@ async def video_propagate(request: VideoPropagateRequest):
 
     Returns:
         JSON response containing:
-        - masks: Dict of masks by object_id and frame_index
-        - scores: Dict of scores by object_id and frame_index
-        - num_frames_processed: Number of frames processed
+        - task_id: Task ID for polling status
+        - message: Status message
     """
     try:
         if not SAM3_VIDEO_AVAILABLE or sam3_video_predictor is None:
@@ -2859,139 +2990,83 @@ async def video_propagate(request: VideoPropagateRequest):
         session = video_sessions[request.session_id]
         predictor_session_id = session.get("predictor_session_id", request.session_id)
 
-        # Build propagate request
-        propagate_request = {
-            "type": "propagate_in_video",
-            "session_id": predictor_session_id,
-        }
-        if request.start_frame != 0:
-            propagate_request["start_frame"] = request.start_frame
-        if request.max_frame is not None:
-            propagate_request["max_frame"] = request.max_frame
-
-        # Use handle_stream_request for propagation (it's a streaming/generator API)
-        if hasattr(sam3_video_predictor, 'handle_stream_request'):
-            masks_by_object = {}
-            scores_by_object = {}
-            frames_processed = 0
-            
-            # handle_stream_request returns a generator
-            for response in sam3_video_predictor.handle_stream_request(request=propagate_request):
-                frame_idx = response.get("frame_index", response.get("frame_idx", frames_processed))
-                outputs = response.get("outputs", {})
-                
-                # Skip metadata keys that are not object masks
-                metadata_keys = {"out_obj_ids", "out_probs", "out_boxes_xywh", "obj_ids", "probs", "boxes"}
-                
-                # Process outputs for each object
-                for obj_id, obj_output in outputs.items():
-                    # Skip metadata entries
-                    if obj_id in metadata_keys:
-                        continue
-                    
-                    # Validate obj_id is an integer (object IDs are numeric)
-                    try:
-                        obj_id_int = int(obj_id)
-                    except (ValueError, TypeError):
-                        # Skip non-numeric keys (they are metadata, not object IDs)
-                        continue
-                    
-                    obj_id_str = str(obj_id_int)
-                    if obj_id_str not in masks_by_object:
-                        masks_by_object[obj_id_str] = {}
-                        scores_by_object[obj_id_str] = {}
-                    
-                    # obj_output can be:
-                    # - a dict with "mask" key
-                    # - a numpy.ndarray directly (the mask itself)
-                    # - a torch.Tensor directly
-                    mask = None
-                    score = 1.0
-                    
-                    if isinstance(obj_output, dict):
-                        mask = obj_output.get("mask", obj_output.get("video_res_mask"))
-                        score = obj_output.get("score", obj_output.get("obj_score", 1.0))
-                    elif isinstance(obj_output, np.ndarray):
-                        # Skip if it's not a valid mask (e.g., empty array or wrong shape)
-                        if obj_output.size == 0 or obj_output.ndim < 2:
-                            continue
-                        mask = obj_output
-                    elif isinstance(obj_output, torch.Tensor):
-                        if obj_output.numel() == 0:
-                            continue
-                        mask = obj_output.cpu().numpy()
-                    else:
-                        # Unknown type, skip
-                        continue
-                    
-                    if mask is not None and mask.size > 0:
-                        if isinstance(mask, torch.Tensor):
-                            mask = mask.cpu().numpy()
-                        
-                        # Skip invalid masks
-                        if mask.size == 0 or mask.ndim < 2:
-                            continue
-                        
-                        # Ensure mask is 2D (height, width)
-                        # Mask can come as (1, H, W), (H, W, 1), (1, 1, H, W), etc.
-                        while mask.ndim > 2:
-                            if mask.shape[0] == 1:
-                                mask = mask[0]
-                            elif mask.shape[-1] == 1:
-                                mask = mask[..., 0]
-                            elif mask.shape[0] > 1:
-                                # Take first channel/batch
-                                mask = mask[0]
-                            else:
-                                break
-                        
-                        # Final check: must be 2D
-                        if mask.ndim != 2:
-                            continue
-                        
-                        # Convert to binary mask
-                        mask = (mask > 0).astype(np.uint8) * 255
-                        
-                        # Encode to base64
-                        try:
-                            mask_image = Image.fromarray(mask, mode="L")
-                            buffer = io.BytesIO()
-                            mask_image.save(buffer, format="PNG")
-                            buffer.seek(0)
-                            masks_by_object[obj_id_str][str(frame_idx)] = base64.b64encode(buffer.getvalue()).decode("utf-8")
-                        except Exception as img_err:
-                            print(f"Warning: Could not encode mask for obj {obj_id}, frame {frame_idx}: {img_err}, shape={mask.shape}, dtype={mask.dtype}")
-                            continue
-                    
-                    # Handle score
-                    if isinstance(score, torch.Tensor):
-                        score = score.item()
-                    scores_by_object[obj_id_str][str(frame_idx)] = float(score)
-                
-                frames_processed += 1
-
-            # Store masks in session for later retrieval via get-frame
-            session["propagated_masks"] = masks_by_object
-            session["propagated_scores"] = scores_by_object
-            
-            # Return summary only - masks are too large to return all at once
-            # Use /video/get-frame/{session_id}/{frame_index} to get individual frames with masks
-            return JSONResponse({
-                "success": True,
-                "num_frames_processed": frames_processed,
-                "objects_tracked": list(masks_by_object.keys()),
-                "message": "Propagation complete. Use /video/get-frame to retrieve frames with masks.",
-            })
-        else:
+        if not hasattr(sam3_video_predictor, 'handle_stream_request'):
             return JSONResponse(
                 status_code=501,
-                content={"error": "Video predictor does not support handle_stream_request for propagation."},
+                content={"error": "Video predictor does not support propagation."},
             )
+
+        # Create task ID
+        task_id = str(uuid.uuid4())
+        
+        # Initialize task status
+        propagation_tasks[task_id] = {
+            "status": "starting",
+            "progress": 0,
+            "frames_processed": 0,
+            "session_id": request.session_id,
+            "created_at": str(np.datetime64("now")),
+        }
+        
+        # Run propagation in background thread (not async because it's CPU/GPU bound)
+        import threading
+        thread = threading.Thread(
+            target=run_propagation_sync,
+            args=(task_id, request.session_id, predictor_session_id, 
+                  request.start_frame, request.max_frame, session)
+        )
+        thread.start()
+        
+        return JSONResponse({
+            "success": True,
+            "task_id": task_id,
+            "message": "Propagation started. Poll /video/propagate-status/{task_id} for progress.",
+        })
 
     except Exception as e:
         import traceback
         traceback.print_exc()
         return JSONResponse(status_code=500, content={"error": str(e)})
+
+
+@app.get("/video/propagate-status/{task_id}")
+async def video_propagate_status(task_id: str):
+    """
+    Get the status of a propagation task.
+
+    Args:
+        task_id: Task ID from /video/propagate
+
+    Returns:
+        JSON response containing:
+        - status: "starting", "processing", "completed", or "failed"
+        - progress: Progress from 0 to 1
+        - frames_processed: Number of frames processed
+        - objects_tracked: List of tracked object IDs (when completed)
+        - error: Error message (when failed)
+    """
+    if task_id not in propagation_tasks:
+        return JSONResponse(
+            status_code=404,
+            content={"error": f"Task {task_id} not found."},
+        )
+    
+    task = propagation_tasks[task_id]
+    
+    response = {
+        "task_id": task_id,
+        "status": task.get("status", "unknown"),
+        "progress": task.get("progress", 0),
+        "frames_processed": task.get("frames_processed", 0),
+    }
+    
+    if task.get("status") == "completed":
+        response["objects_tracked"] = task.get("objects_tracked", [])
+        response["message"] = "Propagation complete. Use /video/get-frame to retrieve frames with masks."
+    elif task.get("status") == "failed":
+        response["error"] = task.get("error", "Unknown error")
+    
+    return JSONResponse(response)
 
 
 @app.get("/video/get-frame/{session_id}/{frame_index}")
