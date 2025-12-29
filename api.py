@@ -616,41 +616,6 @@ async def segment_image_sam3d(request: SegmentSam3dRequest):
                 print(f"  Available methods: {processor_methods}")
                 print(f"  Falling back to direct model API (BatchedDatapoint) for point prompts")
                 raise AttributeError("Sam3Processor doesn't support point prompts. Use direct model API.")
-                elif hasattr(sam3_processor, 'set_point_prompt'):
-                    output = sam3_processor.set_point_prompt(
-                        state=inference_state,
-                        point_coords=point_coords,
-                        point_labels=point_labels,
-                    )
-                elif hasattr(sam3_processor, 'set_prompt'):
-                    output = sam3_processor.set_prompt(
-                        state=inference_state,
-                        point_coords=point_coords,
-                        point_labels=point_labels,
-                    )
-                elif hasattr(sam3_processor, 'predict'):
-                    # Fallback to predict if available
-                    with torch.no_grad():
-                        masks, scores, logits = sam3_processor.predict(
-                            point_coords=point_coords,
-                            point_labels=point_labels,
-                            multimask_output=request.multimask_output,
-                        )
-                    output = {"masks": masks, "scores": scores}
-                else:
-                    # No point prompt methods available
-                    raise AttributeError("Sam3Processor doesn't have point prompt methods. Available methods: " + str(processor_methods))
-                
-                # Extract masks from output
-                if isinstance(output, dict):
-                    masks = output.get("masks", None)
-                    scores = output.get("scores", output.get("iou_scores", None))
-                elif hasattr(output, 'masks'):
-                    masks = output.masks
-                    scores = getattr(output, 'scores', None)
-                else:
-                    masks = output
-                    scores = None
                     
             except Exception as e:
                 import traceback
