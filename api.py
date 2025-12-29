@@ -226,9 +226,11 @@ def initialize_sam3_model():
                 sam3_model = build_sam3_image_model(**kwargs)
 
                 # Model is already on device and in eval mode from build function
-                # Try to find a predictor wrapper
+                # Try to find a predictor wrapper (Sam3Processor from examples)
                 predictor_found = False
                 predictor_paths = [
+                    "sam3.model.sam3_image_processor.Sam3Processor",  # From sam3_agent.ipynb example
+                    "sam3.sam3_image_processor.Sam3Processor",
                     "sam3.sam3_image_predictor",
                     "sam3.predictor",
                     "sam3.SAM3ImagePredictor",
@@ -242,11 +244,19 @@ def initialize_sam3_model():
                             module = __import__(module_path, fromlist=[class_name])
                             if hasattr(module, class_name):
                                 PredictorClass = getattr(module, class_name)
-                                sam3_processor = PredictorClass(sam3_model)
+                                # Sam3Processor takes (model, confidence_threshold) according to example
+                                if "Sam3Processor" in class_name:
+                                    sam3_processor = PredictorClass(sam3_model, confidence_threshold=0.5)
+                                else:
+                                    sam3_processor = PredictorClass(sam3_model)
                                 predictor_found = True
                                 print(f"  ✓ Found predictor: {pred_path}")
+                                # Check if it has set_image method (simpler API)
+                                if hasattr(sam3_processor, 'set_image'):
+                                    print(f"    Processor has 'set_image' method - will use simpler API")
                                 break
-                    except (ImportError, AttributeError, TypeError):
+                    except (ImportError, AttributeError, TypeError) as e:
+                        print(f"    Failed to load {pred_path}: {e}")
                         continue
                 
                 if not predictor_found:
