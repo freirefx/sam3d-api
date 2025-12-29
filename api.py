@@ -615,97 +615,72 @@ async def segment_image_sam3d(request: SegmentSam3dRequest):
 
         elif hasattr(sam3_model, 'forward') and sam3_processor is sam3_model:
             # Direct model API (no separate predictor)
-            # SAM3 may have different interface - try multiple approaches
-            from torchvision.transforms import functional as TF
-            import inspect
-
-            # Prepare image tensor - SAM3 may expect different format
-            image_tensor = TF.to_tensor(image_pil).unsqueeze(0).to(device)
-            image_np_normalized = image_np.astype(np.float32) / 255.0
-            image_tensor_from_np = torch.from_numpy(image_np_normalized).permute(2, 0, 1).unsqueeze(0).to(device)
-
-            # Prepare point prompts - normalize coordinates to [0, 1]
-            h, w = image_np.shape[:2]
-            point_coords_normalized = np.array([[[request.x / w, request.y / h]]], dtype=np.float32)
-            point_coords_tensor = torch.from_numpy(point_coords_normalized).to(device)
-            point_labels_tensor = torch.tensor([[1]], dtype=torch.int64, device=device)
-
-            # Try to get forward signature
-            forward_sig = None
-            if hasattr(sam3_model, 'forward'):
-                try:
-                    forward_sig = inspect.signature(sam3_model.forward)
-                except:
-                    pass
-
-            outputs = None
-            error_messages = []
-
-            with torch.no_grad():
-                # Try different forward signatures based on SAM3 API
-                # Method 1: Direct call with image tensor and points
-                try:
-                    outputs = sam3_model(
-                        image_tensor,
-                        point_coords=point_coords_tensor,
-                        point_labels=point_labels_tensor,
-                    )
-                except Exception as e1:
-                    error_messages.append(f"Method 1 (image_tensor): {str(e1)}")
+            # SAM3 uses BatchedDatapoint interface
+            try:
+                from sam3.model.data_misc import BatchedDatapoint
+                from torchvision.transforms import functional as TF
+                import inspect
+                
+                # Prepare image tensor
+                image_tensor = TF.to_tensor(image_pil).unsqueeze(0).to(device)
+                
+                # Prepare point prompts - normalize coordinates to [0, 1]
+                h, w = image_np.shape[:2]
+                point_coords_normalized = torch.tensor([[[request.x / w, request.y / h]]], dtype=torch.float32, device=device)
+                point_labels_tensor = torch.tensor([[1]], dtype=torch.int64, device=device)
+                
+                # Create BatchedDatapoint
+                # Based on SAM3 structure, we need to create a proper datapoint
+                batched_datapoint = BatchedDatapoint(
+                    image=image_tensor,
+                    point_coords=point_coords_normalized,
+                    point_labels=point_labels_tensor,
+                )
+                
+                with torch.no_grad():
+                    outputs = sam3_model(batched_datapoint)
                     
-                    # Method 2: With normalized image from numpy
-                    try:
-                        outputs = sam3_model(
-                            image_tensor_from_np,
-                            point_coords=point_coords_tensor,
-                            point_labels=point_labels_tensor,
-                        )
-                    except Exception as e2:
-                        error_messages.append(f"Method 2 (image_tensor_from_np): {str(e2)}")
-                        
-                        # Method 3: Batched input format (SAM2-style)
-                        try:
-                            outputs = sam3_model(
-                                batched_input=[{
-                                    "image": image_tensor[0],
-                                    "point_coords": point_coords_tensor[0],
-                                    "point_labels": point_labels_tensor[0],
-                                }],
-                                multimask_output=request.multimask_output,
-                            )
-                        except Exception as e3:
-                            error_messages.append(f"Method 3 (batched_input): {str(e3)}")
-                            
-                            # Method 4: Try with image as numpy array
-                            try:
-                                outputs = sam3_model(
-                                    image_np,
-                                    point_coords=point_coords_normalized,
-                                    point_labels=np.array([[1]], dtype=np.int64),
-                                )
-                            except Exception as e4:
-                                error_messages.append(f"Method 4 (numpy): {str(e4)}")
-                                
-                                # If all methods fail, return error with details
-                                return JSONResponse(
-                                    status_code=500,
-                                    content={
-                                        "error": "SAM3 model forward call failed. Tried multiple interfaces.",
-                                        "attempts": error_messages,
-                                        "forward_signature": str(forward_sig) if forward_sig else "Could not inspect",
-                                    },
-                                )
+            except ImportError as e:
+                return JSONResponse(
+                    status_code=500,
+                    content={
+                        "error": f"SAM3 BatchedDatapoint import failed: {str(e)}",
+                        "message": "SAM3 model structure may have changed. Please check SAM3 documentation."
+                    },
+                )
+            except Exception as e:
+                # Fallback: try to understand the error and provide helpful message
+                import traceback
+                error_trace = traceback.format_exc()
+                return JSONResponse(
+                    status_code=500,
+                    content={
+                        "error": f"SAM3 model forward call failed: {str(e)}",
+                        "trace": error_trace,
+                        "message": "SAM3 model requires BatchedDatapoint. Please check SAM3 documentation for correct usage."
+                    },
+                )
 
             # Extract masks from output
+            # SAM3 output structure may vary - try to extract masks
+            masks = None
+            scores = None
+            
             if isinstance(outputs, dict):
-                masks = outputs.get("masks", outputs.get("pred_masks", None))
-                scores = outputs.get("iou_predictions", outputs.get("scores", None))
+                masks = outputs.get("masks", outputs.get("pred_masks", outputs.get("mask", None)))
+                scores = outputs.get("iou_predictions", outputs.get("scores", outputs.get("iou_scores", None)))
+            elif hasattr(outputs, 'masks'):
+                masks = outputs.masks
+                scores = getattr(outputs, 'scores', None) or getattr(outputs, 'iou_scores', None)
             elif isinstance(outputs, (list, tuple)):
                 masks = outputs[0] if len(outputs) > 0 else None
                 scores = outputs[1] if len(outputs) > 1 else None
-            else:
+            elif isinstance(outputs, torch.Tensor):
                 masks = outputs
-                scores = None
+            else:
+                # Try to access as attribute
+                masks = getattr(outputs, 'masks', None) or getattr(outputs, 'pred_masks', None)
+                scores = getattr(outputs, 'scores', None) or getattr(outputs, 'iou_scores', None)
 
             if masks is not None:
                 if isinstance(masks, torch.Tensor):
@@ -718,6 +693,15 @@ async def segment_image_sam3d(request: SegmentSam3dRequest):
                     scores = [0.95] * len(masks)
                 elif isinstance(scores, torch.Tensor):
                     scores = scores.cpu().numpy().flatten().tolist()
+                elif not isinstance(scores, (list, tuple)):
+                    scores = [0.95] * len(masks)
+
+                # Limit to requested number of masks
+                if not request.multimask_output and len(masks) > 1:
+                    # Use the mask with highest score
+                    best_idx = np.argmax(scores) if len(scores) > 0 else 0
+                    masks = masks[best_idx:best_idx+1]
+                    scores = [scores[best_idx]] if len(scores) > best_idx else [0.95]
 
                 for i in range(len(masks)):
                     mask = masks[i]
@@ -745,7 +729,11 @@ async def segment_image_sam3d(request: SegmentSam3dRequest):
             else:
                 return JSONResponse(
                     status_code=500,
-                    content={"error": "SAM3 model returned no masks. Model API may be incompatible."},
+                    content={
+                        "error": "SAM3 model returned no masks. Model API may be incompatible.",
+                        "output_type": str(type(outputs)),
+                        "output_attrs": dir(outputs) if hasattr(outputs, '__dict__') else "N/A"
+                    },
                 )
 
         else:
@@ -1072,95 +1060,91 @@ async def segment_image_binary_sam3d(request: SegmentBinarySam3dRequest):
 
         elif hasattr(sam3_model, 'forward') and sam3_processor is sam3_model:
             # Direct model API (no separate predictor)
-            from torchvision.transforms import functional as TF
-            import inspect
+            # SAM3 uses BatchedDatapoint interface
+            try:
+                from sam3.model.data_misc import BatchedDatapoint
+                from torchvision.transforms import functional as TF
 
-            # Prepare image tensor - SAM3 may expect different format
-            image_tensor = TF.to_tensor(image_pil).unsqueeze(0).to(device)
-            image_np_normalized = image_np.astype(np.float32) / 255.0
-            image_tensor_from_np = torch.from_numpy(image_np_normalized).permute(2, 0, 1).unsqueeze(0).to(device)
+                # Prepare image tensor
+                image_tensor = TF.to_tensor(image_pil).unsqueeze(0).to(device)
+                h, w = image_np.shape[:2]
 
-            h, w = image_np.shape[:2]
+                for point in request.points:
+                    # Normalize coordinates to [0, 1]
+                    point_coords_tensor = torch.tensor([[[point["x"] / w, point["y"] / h]]], dtype=torch.float32, device=device)
+                    point_labels_tensor = torch.tensor([[1]], dtype=torch.int64, device=device)
 
-            for point in request.points:
-                # Normalize coordinates to [0, 1]
-                point_coords_normalized = np.array([[[point["x"] / w, point["y"] / h]]], dtype=np.float32)
-                point_coords_tensor = torch.from_numpy(point_coords_normalized).to(device)
-                point_labels_tensor = torch.tensor([[1]], dtype=torch.int64, device=device)
+                    # Create BatchedDatapoint
+                    batched_datapoint = BatchedDatapoint(
+                        image=image_tensor,
+                        point_coords=point_coords_tensor,
+                        point_labels=point_labels_tensor,
+                    )
 
-                outputs = None
-                error_messages = []
+                    with torch.no_grad():
+                        outputs = sam3_model(batched_datapoint)
 
-                with torch.no_grad():
-                    # Try different forward signatures
-                    try:
-                        outputs = sam3_model(
-                            image_tensor,
-                            point_coords=point_coords_tensor,
-                            point_labels=point_labels_tensor,
-                        )
-                    except Exception as e1:
-                        error_messages.append(f"Method 1: {str(e1)}")
-                        try:
-                            outputs = sam3_model(
-                                image_tensor_from_np,
-                                point_coords=point_coords_tensor,
-                                point_labels=point_labels_tensor,
-                            )
-                        except Exception as e2:
-                            error_messages.append(f"Method 2: {str(e2)}")
-                            try:
-                                outputs = sam3_model(
-                                    batched_input=[{
-                                        "image": image_tensor[0],
-                                        "point_coords": point_coords_tensor[0],
-                                        "point_labels": point_labels_tensor[0],
-                                    }],
-                                    multimask_output=False,
-                                )
-                            except Exception as e3:
-                                error_messages.append(f"Method 3: {str(e3)}")
-                                try:
-                                    outputs = sam3_model(
-                                        image_np,
-                                        point_coords=point_coords_normalized,
-                                        point_labels=np.array([[1]], dtype=np.int64),
-                                    )
-                                except Exception as e4:
-                                    error_messages.append(f"Method 4: {str(e4)}")
-                                    # Skip this point if all methods fail
-                                    print(f"⚠ Failed to process point {point}: {error_messages}")
-                                    continue
-
-                # Extract masks from output
-                if isinstance(outputs, dict):
-                    masks = outputs.get("masks", outputs.get("pred_masks", None))
-                    scores = outputs.get("iou_predictions", outputs.get("scores", None))
-                elif isinstance(outputs, (list, tuple)):
-                    masks = outputs[0] if len(outputs) > 0 else None
-                    scores = outputs[1] if len(outputs) > 1 else None
-                else:
-                    masks = outputs
+                    # Extract masks from output
+                    masks = None
                     scores = None
+                    
+                    if isinstance(outputs, dict):
+                        masks = outputs.get("masks", outputs.get("pred_masks", outputs.get("mask", None)))
+                        scores = outputs.get("iou_predictions", outputs.get("scores", outputs.get("iou_scores", None)))
+                    elif hasattr(outputs, 'masks'):
+                        masks = outputs.masks
+                        scores = getattr(outputs, 'scores', None) or getattr(outputs, 'iou_scores', None)
+                    elif isinstance(outputs, (list, tuple)):
+                        masks = outputs[0] if len(outputs) > 0 else None
+                        scores = outputs[1] if len(outputs) > 1 else None
+                    elif isinstance(outputs, torch.Tensor):
+                        masks = outputs
+                    else:
+                        masks = getattr(outputs, 'masks', None) or getattr(outputs, 'pred_masks', None)
+                        scores = getattr(outputs, 'scores', None) or getattr(outputs, 'iou_scores', None)
 
-                if masks is not None:
-                    if isinstance(masks, torch.Tensor):
-                        masks = masks.cpu().numpy()
-                    masks = np.squeeze(masks)
-                    if masks.ndim == 2:
-                        masks = masks[np.newaxis, ...]
+                    if masks is not None:
+                        if isinstance(masks, torch.Tensor):
+                            masks = masks.cpu().numpy()
+                        masks = np.squeeze(masks)
+                        if masks.ndim == 2:
+                            masks = masks[np.newaxis, ...]
 
-                    if scores is None:
-                        scores = np.array([0.95])
-                    elif isinstance(scores, torch.Tensor):
-                        scores = scores.cpu().numpy().flatten()
+                        if scores is None:
+                            scores = np.array([0.95])
+                        elif isinstance(scores, torch.Tensor):
+                            scores = scores.cpu().numpy().flatten()
+                        elif not isinstance(scores, (list, tuple, np.ndarray)):
+                            scores = np.array([0.95])
 
-                    best_idx = np.argmax(scores)
-                    point_mask = masks[best_idx]
-                    best_score = float(scores[best_idx])
+                        best_idx = np.argmax(scores) if len(scores) > 0 else 0
+                        point_mask = masks[best_idx] if masks.ndim > 2 else masks
+                        best_score = float(scores[best_idx]) if len(scores) > best_idx else 0.95
 
-                    point_mask = (point_mask > request.mask_threshold).astype(np.uint8) * 255
-                    all_masks.append(point_mask)
+                        point_mask = (point_mask > request.mask_threshold).astype(np.uint8) * 255
+                        all_masks.append(point_mask)
+                    else:
+                        print(f"⚠ Failed to extract mask from point {point}")
+                        
+            except ImportError as e:
+                return JSONResponse(
+                    status_code=500,
+                    content={
+                        "error": f"SAM3 BatchedDatapoint import failed: {str(e)}",
+                        "message": "SAM3 model structure may have changed. Please check SAM3 documentation."
+                    },
+                )
+            except Exception as e:
+                import traceback
+                error_trace = traceback.format_exc()
+                print(f"⚠ Error processing points: {error_trace}")
+                return JSONResponse(
+                    status_code=500,
+                    content={
+                        "error": f"SAM3 model forward call failed: {str(e)}",
+                        "message": "SAM3 model requires BatchedDatapoint. Please check SAM3 documentation for correct usage."
+                    },
+                )
 
         else:
             # HuggingFace Transformers API
