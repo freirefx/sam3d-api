@@ -2905,15 +2905,31 @@ async def video_propagate(request: VideoPropagateRequest):
                     if mask is not None:
                         if isinstance(mask, torch.Tensor):
                             mask = mask.cpu().numpy()
-                        mask = np.squeeze(mask)
+                        
+                        # Ensure mask is 2D (height, width)
+                        # Mask can come as (1, H, W), (H, W, 1), (1, 1, H, W), etc.
+                        while mask.ndim > 2:
+                            if mask.shape[0] == 1:
+                                mask = mask[0]
+                            elif mask.shape[-1] == 1:
+                                mask = mask[..., 0]
+                            else:
+                                # Take first channel/batch
+                                mask = mask[0]
+                        
+                        # Convert to binary mask
                         mask = (mask > 0).astype(np.uint8) * 255
                         
                         # Encode to base64
-                        mask_image = Image.fromarray(mask, mode="L")
-                        buffer = io.BytesIO()
-                        mask_image.save(buffer, format="PNG")
-                        buffer.seek(0)
-                        masks_by_object[obj_id_str][str(frame_idx)] = base64.b64encode(buffer.getvalue()).decode("utf-8")
+                        try:
+                            mask_image = Image.fromarray(mask, mode="L")
+                            buffer = io.BytesIO()
+                            mask_image.save(buffer, format="PNG")
+                            buffer.seek(0)
+                            masks_by_object[obj_id_str][str(frame_idx)] = base64.b64encode(buffer.getvalue()).decode("utf-8")
+                        except Exception as img_err:
+                            print(f"Warning: Could not encode mask for obj {obj_id}, frame {frame_idx}: {img_err}, shape={mask.shape}, dtype={mask.dtype}")
+                            continue
                     
                     # Handle score
                     if isinstance(score, torch.Tensor):
