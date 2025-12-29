@@ -600,8 +600,49 @@ async def segment_image_sam3d(request: SegmentSam3dRequest):
                 print(f"✓ Image set, inference_state type: {type(inference_state)}")
                 
                 # Try to find method for point prompts
-                # Sam3Processor might use set_point_prompt, set_prompt, or similar
-                if hasattr(sam3_processor, 'set_point_prompt'):
+                # Sam3Processor has add_geometric_prompt for points
+                if hasattr(sam3_processor, 'add_geometric_prompt'):
+                    # add_geometric_prompt likely takes point coordinates and labels
+                    # Try different parameter formats
+                    import inspect
+                    try:
+                        sig = inspect.signature(sam3_processor.add_geometric_prompt)
+                        print(f"add_geometric_prompt signature: {sig}")
+                    except:
+                        pass
+                    
+                    try:
+                        # Try with state as first positional argument
+                        output = sam3_processor.add_geometric_prompt(
+                            inference_state,
+                            point_coords=point_coords,  # [[x, y]]
+                            point_labels=point_labels,   # [1] for positive
+                        )
+                        print(f"✓ Used add_geometric_prompt (format 1), output type: {type(output)}")
+                    except Exception as e:
+                        print(f"⚠ add_geometric_prompt format 1 failed: {e}, trying format 2...")
+                        try:
+                            # Try with state as keyword argument
+                            output = sam3_processor.add_geometric_prompt(
+                                state=inference_state,
+                                point_coords=point_coords,
+                                point_labels=point_labels,
+                            )
+                            print(f"✓ Used add_geometric_prompt (format 2), output type: {type(output)}")
+                        except Exception as e2:
+                            print(f"⚠ add_geometric_prompt format 2 failed: {e2}, trying format 3...")
+                            try:
+                                # Try with points/labels instead of point_coords/point_labels
+                                output = sam3_processor.add_geometric_prompt(
+                                    inference_state,
+                                    points=point_coords,
+                                    labels=point_labels,
+                                )
+                                print(f"✓ Used add_geometric_prompt (format 3), output type: {type(output)}")
+                            except Exception as e3:
+                                print(f"⚠ All add_geometric_prompt formats failed. Last error: {e3}")
+                                raise e3
+                elif hasattr(sam3_processor, 'set_point_prompt'):
                     output = sam3_processor.set_point_prompt(
                         state=inference_state,
                         point_coords=point_coords,
@@ -623,7 +664,7 @@ async def segment_image_sam3d(request: SegmentSam3dRequest):
                         )
                     output = {"masks": masks, "scores": scores}
                 else:
-                    # Try calling with inference_state directly
+                    # No point prompt methods available
                     raise AttributeError("Sam3Processor doesn't have point prompt methods. Available methods: " + str(processor_methods))
                 
                 # Extract masks from output
@@ -881,23 +922,34 @@ async def segment_image_sam3d(request: SegmentSam3dRequest):
                 )
 
         else:
-            # HuggingFace Transformers API
-            input_points = [[[[request.x, request.y]]]]
-            input_labels = [[[1]]]
+            # HuggingFace Transformers API (only if processor is callable)
+            if callable(sam3_processor):
+                input_points = [[[[request.x, request.y]]]]
+                input_labels = [[[1]]]
 
-            inputs = sam3_processor(
-                images=image_pil,
-                input_points=input_points,
-                input_labels=input_labels,
-                return_tensors="pt",
-            ).to(device)
+                inputs = sam3_processor(
+                    images=image_pil,
+                    input_points=input_points,
+                    input_labels=input_labels,
+                    return_tensors="pt",
+                ).to(device)
 
-            with torch.no_grad():
-                outputs = sam3_model(**inputs)
+                with torch.no_grad():
+                    outputs = sam3_model(**inputs)
 
-            masks = sam3_processor.post_process_masks(
-                outputs.pred_masks.cpu(), inputs["original_sizes"]
-            )[0]
+                masks = sam3_processor.post_process_masks(
+                    outputs.pred_masks.cpu(), inputs["original_sizes"]
+                )[0]
+            else:
+                # If processor is not callable (e.g., Sam3Processor), return error
+                return JSONResponse(
+                    status_code=500,
+                    content={
+                        "error": "SAM3 processor API not fully implemented for this processor type.",
+                        "processor_type": str(type(sam3_processor)),
+                        "message": "Sam3Processor doesn't support HuggingFace-style API. Please use point prompts via add_geometric_prompt or direct model API."
+                    },
+                )
 
             scores = (
                 outputs.iou_preds[0].cpu().numpy().tolist()
@@ -1334,24 +1386,35 @@ async def segment_image_binary_sam3d(request: SegmentBinarySam3dRequest):
                 )
 
         else:
-            # HuggingFace Transformers API
-            for point in request.points:
-                input_points = [[[[point["x"], point["y"]]]]]
-                input_labels = [[[1]]]
+            # HuggingFace Transformers API (only if processor is callable)
+            if callable(sam3_processor):
+                for point in request.points:
+                    input_points = [[[[point["x"], point["y"]]]]]
+                    input_labels = [[[1]]]
 
-                inputs = sam3_processor(
-                    images=image_pil,
-                    input_points=input_points,
-                    input_labels=input_labels,
-                    return_tensors="pt",
-                ).to(device)
+                    inputs = sam3_processor(
+                        images=image_pil,
+                        input_points=input_points,
+                        input_labels=input_labels,
+                        return_tensors="pt",
+                    ).to(device)
 
-                with torch.no_grad():
-                    outputs = sam3_model(**inputs)
+                    with torch.no_grad():
+                        outputs = sam3_model(**inputs)
 
-                masks = sam3_processor.post_process_masks(
-                    outputs.pred_masks.cpu(), inputs["original_sizes"]
-                )[0]
+                    masks = sam3_processor.post_process_masks(
+                        outputs.pred_masks.cpu(), inputs["original_sizes"]
+                    )[0]
+            else:
+                # If processor is not callable, return error
+                return JSONResponse(
+                    status_code=500,
+                    content={
+                        "error": "SAM3 processor API not fully implemented for this processor type.",
+                        "processor_type": str(type(sam3_processor)),
+                        "message": "Sam3Processor doesn't support HuggingFace-style API for multiple points. Please use direct model API."
+                    },
+                )
 
                 scores = (
                     outputs.iou_preds[0].cpu().numpy()
