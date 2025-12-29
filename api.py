@@ -629,42 +629,37 @@ async def segment_image_sam3d(request: SegmentSam3dRequest):
                 point_labels_tensor = torch.tensor([[1]], dtype=torch.int64, device=device)
                 
                 # Create FindStage for point prompts
-                # FindStage likely contains point coordinates and labels
-                try:
-                    # Try to create FindStage - check its signature
-                    import inspect
-                    find_stage_sig = inspect.signature(FindStage.__init__)
-                    print(f"FindStage signature: {find_stage_sig}")
-                    
-                    # Common patterns: FindStage might accept point_coords, point_labels, or a dict
-                    try:
-                        find_stage = FindStage(
-                            point_coords=point_coords_normalized[0],  # Remove batch dimension
-                            point_labels=point_labels_tensor[0],
-                        )
-                    except TypeError:
-                        # Try alternative signatures
-                        try:
-                            find_stage = FindStage(
-                                coords=point_coords_normalized[0],
-                                labels=point_labels_tensor[0],
-                            )
-                        except TypeError:
-                            # Try with dict or other structure
-                            find_stage = FindStage({
-                                "point_coords": point_coords_normalized[0],
-                                "point_labels": point_labels_tensor[0],
-                            })
-                    
-                    print(f"✓ FindStage created")
-                except Exception as e:
-                    print(f"⚠ FindStage creation failed: {e}")
-                    # Try to create empty FindStage and set attributes
-                    find_stage = FindStage()
-                    if hasattr(find_stage, 'point_coords'):
-                        find_stage.point_coords = point_coords_normalized[0]
-                    if hasattr(find_stage, 'point_labels'):
-                        find_stage.point_labels = point_labels_tensor[0]
+                # FindStage requires: img_ids, text_ids, input_boxes, input_boxes_mask, input_boxes_label, input_points, input_points_mask
+                # For point-based segmentation:
+                # - img_ids: [0] for single image
+                # - text_ids: empty tensor/list for no text prompts
+                # - input_boxes: empty for point-only segmentation
+                # - input_boxes_mask: empty
+                # - input_boxes_label: empty
+                # - input_points: point coordinates (normalized to [0,1])
+                # - input_points_mask: mask indicating which points are valid (all 1s for our case)
+                
+                img_ids = torch.tensor([0], dtype=torch.long, device=device)  # Single image, ID 0
+                text_ids = torch.empty((0,), dtype=torch.long, device=device)  # No text prompts
+                input_boxes = torch.empty((1, 0, 4), dtype=torch.float32, device=device)  # No boxes
+                input_boxes_mask = torch.zeros((1, 0), dtype=torch.bool, device=device)  # No boxes
+                input_boxes_label = torch.empty((1, 0), dtype=torch.long, device=device)  # No box labels
+                
+                # input_points: shape should be [batch, num_points, 2] - normalized coordinates
+                input_points = point_coords_normalized  # Already in shape [1, 1, 2]
+                # input_points_mask: shape [batch, num_points] - 1 for valid points
+                input_points_mask = torch.ones((1, 1), dtype=torch.bool, device=device)
+                
+                find_stage = FindStage(
+                    img_ids=img_ids,
+                    text_ids=text_ids,
+                    input_boxes=input_boxes,
+                    input_boxes_mask=input_boxes_mask,
+                    input_boxes_label=input_boxes_label,
+                    input_points=input_points,
+                    input_points_mask=input_points_mask,
+                )
+                print(f"✓ FindStage created successfully")
                 
                 # Create BatchedFindTarget (likely empty for segmentation)
                 try:
@@ -1134,23 +1129,27 @@ async def segment_image_binary_sam3d(request: SegmentBinarySam3dRequest):
                     point_labels_tensor = torch.tensor([[1]], dtype=torch.int64, device=device)
 
                     # Create FindStage for point prompts
-                    try:
-                        find_stage = FindStage(
-                            point_coords=point_coords_normalized[0],
-                            point_labels=point_labels_tensor[0],
-                        )
-                    except TypeError:
-                        try:
-                            find_stage = FindStage(
-                                coords=point_coords_normalized[0],
-                                labels=point_labels_tensor[0],
-                            )
-                        except TypeError:
-                            find_stage = FindStage()
-                            if hasattr(find_stage, 'point_coords'):
-                                find_stage.point_coords = point_coords_normalized[0]
-                            if hasattr(find_stage, 'point_labels'):
-                                find_stage.point_labels = point_labels_tensor[0]
+                    # FindStage requires all fields
+                    img_ids = torch.tensor([0], dtype=torch.long, device=device)
+                    text_ids = torch.empty((0,), dtype=torch.long, device=device)
+                    input_boxes = torch.empty((1, 0, 4), dtype=torch.float32, device=device)
+                    input_boxes_mask = torch.zeros((1, 0), dtype=torch.bool, device=device)
+                    input_boxes_label = torch.empty((1, 0), dtype=torch.long, device=device)
+                    
+                    # input_points: shape [batch, num_points, 2]
+                    input_points = point_coords_normalized
+                    # input_points_mask: shape [batch, num_points]
+                    input_points_mask = torch.ones((1, 1), dtype=torch.bool, device=device)
+                    
+                    find_stage = FindStage(
+                        img_ids=img_ids,
+                        text_ids=text_ids,
+                        input_boxes=input_boxes,
+                        input_boxes_mask=input_boxes_mask,
+                        input_boxes_label=input_boxes_label,
+                        input_points=input_points,
+                        input_points_mask=input_points_mask,
+                    )
                     
                     # Create BatchedFindTarget and BatchedInferenceMetadata
                     try:
