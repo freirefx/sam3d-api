@@ -599,49 +599,23 @@ async def segment_image_sam3d(request: SegmentSam3dRequest):
                 inference_state = sam3_processor.set_image(image_pil)
                 print(f"✓ Image set, inference_state type: {type(inference_state)}")
                 
-                # Try to find method for point prompts
-                # Sam3Processor has add_geometric_prompt for points
+                # Sam3Processor doesn't support point prompts directly
+                # add_geometric_prompt is for BOXES, not points
+                # set_text_prompt is for text prompts
+                # For point prompts, we need to use the direct model API (BatchedDatapoint)
+                import inspect
                 if hasattr(sam3_processor, 'add_geometric_prompt'):
-                    # add_geometric_prompt likely takes point coordinates and labels
-                    # Try different parameter formats
-                    import inspect
                     try:
                         sig = inspect.signature(sam3_processor.add_geometric_prompt)
                         print(f"add_geometric_prompt signature: {sig}")
+                        print(f"  Note: add_geometric_prompt is for BOXES, not points.")
                     except:
                         pass
-                    
-                    try:
-                        # Try with state as first positional argument
-                        output = sam3_processor.add_geometric_prompt(
-                            inference_state,
-                            point_coords=point_coords,  # [[x, y]]
-                            point_labels=point_labels,   # [1] for positive
-                        )
-                        print(f"✓ Used add_geometric_prompt (format 1), output type: {type(output)}")
-                    except Exception as e:
-                        print(f"⚠ add_geometric_prompt format 1 failed: {e}, trying format 2...")
-                        try:
-                            # Try with state as keyword argument
-                            output = sam3_processor.add_geometric_prompt(
-                                state=inference_state,
-                                point_coords=point_coords,
-                                point_labels=point_labels,
-                            )
-                            print(f"✓ Used add_geometric_prompt (format 2), output type: {type(output)}")
-                        except Exception as e2:
-                            print(f"⚠ add_geometric_prompt format 2 failed: {e2}, trying format 3...")
-                            try:
-                                # Try with points/labels instead of point_coords/point_labels
-                                output = sam3_processor.add_geometric_prompt(
-                                    inference_state,
-                                    points=point_coords,
-                                    labels=point_labels,
-                                )
-                                print(f"✓ Used add_geometric_prompt (format 3), output type: {type(output)}")
-                            except Exception as e3:
-                                print(f"⚠ All add_geometric_prompt formats failed. Last error: {e3}")
-                                raise e3
+                
+                print(f"Sam3Processor doesn't support point prompts directly.")
+                print(f"  Available methods: {processor_methods}")
+                print(f"  Falling back to direct model API (BatchedDatapoint) for point prompts")
+                raise AttributeError("Sam3Processor doesn't support point prompts. Use direct model API.")
                 elif hasattr(sam3_processor, 'set_point_prompt'):
                     output = sam3_processor.set_point_prompt(
                         state=inference_state,
