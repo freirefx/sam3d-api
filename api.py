@@ -272,26 +272,35 @@ def initialize_sam3_model():
                 
                 # Try to detect expected image size from model's positional encoding
                 # The RoPE freqs_cis has a specific shape that determines the expected sequence length
+                # Note: Different blocks may have different sizes (multi-scale architecture)
                 try:
                     if hasattr(sam3_model, 'backbone') and hasattr(sam3_model.backbone, 'vision_backbone'):
                         vision = sam3_model.backbone.vision_backbone
                         if hasattr(vision, 'trunk'):
+                            detected_sizes = []
                             for name, module in vision.trunk.named_modules():
                                 if hasattr(module, 'freqs_cis'):
                                     freqs_shape = module.freqs_cis.shape
-                                    print(f"  Found freqs_cis in {name}: shape {freqs_shape}")
-                                    # Store this info for later use
-                                    if not hasattr(sam3_model, '_detected_seq_len'):
-                                        sam3_model._detected_seq_len = freqs_shape[0] if len(freqs_shape) > 0 else None
-                                        sam3_model._freqs_cis_shape = freqs_shape
-                                        # Calculate expected image size
-                                        # seq_len = (H/patch_size) * (W/patch_size), patch_size=16 for SAM
-                                        # For square: H=W, seq_len = H²/256, so H = sqrt(seq_len * 256)
-                                        if sam3_model._detected_seq_len:
-                                            estimated_size = int((sam3_model._detected_seq_len * 256) ** 0.5)
-                                            estimated_size = (estimated_size // 16) * 16  # Round to multiple of 16
-                                            sam3_model._estimated_image_size = estimated_size
-                                            print(f"  Estimated image size: {estimated_size}x{estimated_size}")
+                                    seq_len = freqs_shape[0] if len(freqs_shape) > 0 else None
+                                    if seq_len:
+                                        # Calculate image size: seq_len = (H/patch_size) * (W/patch_size)
+                                        # For square: H = sqrt(seq_len * 256)
+                                        patch_size = 16
+                                        estimated_size = int((seq_len * patch_size * patch_size) ** 0.5)
+                                        estimated_size = (estimated_size // patch_size) * patch_size
+                                        detected_sizes.append((seq_len, estimated_size, name))
+                            
+                            # Use the largest size found (likely the main resolution)
+                            if detected_sizes:
+                                detected_sizes.sort(key=lambda x: x[0], reverse=True)
+                                largest = detected_sizes[0]
+                                sam3_model._detected_seq_len = largest[0]
+                                sam3_model._estimated_image_size = largest[1]
+                                sam3_model._all_detected_sizes = detected_sizes
+                                print(f"  Detected {len(detected_sizes)} different freqs_cis sizes:")
+                                for seq_len, size, name in detected_sizes[:5]:  # Show first 5
+                                    print(f"    {name}: seq_len={seq_len}, size={size}x{size}")
+                                print(f"  Using largest: {largest[1]}x{largest[1]} (seq_len={largest[0]})")
                 except Exception as e:
                     print(f"  Could not detect expected size: {e}")
                 
@@ -708,9 +717,33 @@ async def segment_image_sam3d(request: SegmentSam3dRequest):
                     print(f"Sequence length: actual={actual_seq_len}, expected={detected_seq_len}, match={actual_seq_len == detected_seq_len}")
                 
                 # Prepare point prompts - normalize coordinates to [0, 1]
-                # Since we're using original image size, no scaling needed
-                point_coords_normalized = torch.tensor([[[request.x / w, request.y / h]]], dtype=torch.float32, device=device)
-                print(f"Point coordinates: original=({request.x}, {request.y}), normalized=({request.x/w:.4f}, {request.y/h:.4f})")
+                # If image was resized, we need to adjust coordinates
+                estimated_size = getattr(sam3_model, '_estimated_image_size', None)
+                if estimated_size and estimated_size != original_w and estimated_size != original_h:
+                    # Image was resized and possibly padded
+                    ratio = min(estimated_size / original_w, estimated_size / original_h)
+                    new_w = int(original_w * ratio)
+                    new_h = int(original_h * ratio)
+                    new_w = (new_w // 16) * 16
+                    new_h = (new_h // 16) * 16
+                    
+                    # Scale point coordinates
+                    scaled_x = request.x * (new_w / original_w)
+                    scaled_y = request.y * (new_h / original_h)
+                    
+                    # Add padding offset if image was padded
+                    paste_x = (estimated_size - new_w) // 2
+                    paste_y = (estimated_size - new_h) // 2
+                    scaled_x += paste_x
+                    scaled_y += paste_y
+                    
+                    # Normalize to [0, 1]
+                    point_coords_normalized = torch.tensor([[[scaled_x / estimated_size, scaled_y / estimated_size]]], dtype=torch.float32, device=device)
+                    print(f"Point coordinates: original=({request.x}, {request.y}), scaled=({scaled_x:.2f}, {scaled_y:.2f}), normalized=({scaled_x/estimated_size:.4f}, {scaled_y/estimated_size:.4f})")
+                else:
+                    # No resizing, use original coordinates
+                    point_coords_normalized = torch.tensor([[[request.x / w, request.y / h]]], dtype=torch.float32, device=device)
+                    print(f"Point coordinates: original=({request.x}, {request.y}), normalized=({request.x/w:.4f}, {request.y/h:.4f})")
                 point_labels_tensor = torch.tensor([[1]], dtype=torch.int64, device=device)
                 
                 # Create FindStage for point prompts
