@@ -615,13 +615,12 @@ async def segment_image_sam3d(request: SegmentSam3dRequest):
 
         elif hasattr(sam3_model, 'forward') and sam3_processor is sam3_model:
             # Direct model API (no separate predictor)
-            # SAM3 uses BatchedDatapoint interface
+            # SAM3 uses BatchedDatapoint interface with specific structure
             try:
-                from sam3.model.data_misc import BatchedDatapoint
+                from sam3.model.data_misc import BatchedDatapoint, FindStage, BatchedFindTarget, BatchedInferenceMetadata
                 from torchvision.transforms import functional as TF
-                import inspect
                 
-                # Prepare image tensor
+                # Prepare image tensor - SAM3 expects img_batch
                 image_tensor = TF.to_tensor(image_pil).unsqueeze(0).to(device)
                 
                 # Prepare point prompts - normalize coordinates to [0, 1]
@@ -629,40 +628,66 @@ async def segment_image_sam3d(request: SegmentSam3dRequest):
                 point_coords_normalized = torch.tensor([[[request.x / w, request.y / h]]], dtype=torch.float32, device=device)
                 point_labels_tensor = torch.tensor([[1]], dtype=torch.int64, device=device)
                 
-                # Check BatchedDatapoint structure
+                # Create FindStage for point prompts
+                # FindStage likely contains point coordinates and labels
                 try:
-                    datapoint_sig = inspect.signature(BatchedDatapoint.__init__)
-                    print(f"BatchedDatapoint signature: {datapoint_sig}")
-                except:
-                    pass
-                
-                # Try to create BatchedDatapoint - check what fields it expects
-                try:
-                    # Try with named arguments first
-                    batched_datapoint = BatchedDatapoint(
-                        image=image_tensor,
-                        point_coords=point_coords_normalized,
-                        point_labels=point_labels_tensor,
-                    )
-                    print(f"✓ BatchedDatapoint created successfully")
-                except TypeError as te:
-                    # If that fails, try to see what fields are expected
-                    print(f"⚠ BatchedDatapoint creation failed: {te}")
-                    # Try to inspect the class
-                    if hasattr(BatchedDatapoint, '__annotations__'):
-                        print(f"BatchedDatapoint annotations: {BatchedDatapoint.__annotations__}")
-                    # Try creating with just image first
+                    # Try to create FindStage - check its signature
+                    import inspect
+                    find_stage_sig = inspect.signature(FindStage.__init__)
+                    print(f"FindStage signature: {find_stage_sig}")
+                    
+                    # Common patterns: FindStage might accept point_coords, point_labels, or a dict
                     try:
-                        batched_datapoint = BatchedDatapoint(image=image_tensor)
-                        # Then try to set attributes
-                        if hasattr(batched_datapoint, 'point_coords'):
-                            batched_datapoint.point_coords = point_coords_normalized
-                        if hasattr(batched_datapoint, 'point_labels'):
-                            batched_datapoint.point_labels = point_labels_tensor
-                        print(f"✓ BatchedDatapoint created with attribute assignment")
-                    except Exception as e2:
-                        print(f"⚠ Alternative creation failed: {e2}")
-                        raise te
+                        find_stage = FindStage(
+                            point_coords=point_coords_normalized[0],  # Remove batch dimension
+                            point_labels=point_labels_tensor[0],
+                        )
+                    except TypeError:
+                        # Try alternative signatures
+                        try:
+                            find_stage = FindStage(
+                                coords=point_coords_normalized[0],
+                                labels=point_labels_tensor[0],
+                            )
+                        except TypeError:
+                            # Try with dict or other structure
+                            find_stage = FindStage({
+                                "point_coords": point_coords_normalized[0],
+                                "point_labels": point_labels_tensor[0],
+                            })
+                    
+                    print(f"✓ FindStage created")
+                except Exception as e:
+                    print(f"⚠ FindStage creation failed: {e}")
+                    # Try to create empty FindStage and set attributes
+                    find_stage = FindStage()
+                    if hasattr(find_stage, 'point_coords'):
+                        find_stage.point_coords = point_coords_normalized[0]
+                    if hasattr(find_stage, 'point_labels'):
+                        find_stage.point_labels = point_labels_tensor[0]
+                
+                # Create BatchedFindTarget (likely empty for segmentation)
+                try:
+                    find_target = BatchedFindTarget()
+                except:
+                    find_target = None
+                
+                # Create BatchedInferenceMetadata
+                try:
+                    metadata = BatchedInferenceMetadata()
+                except:
+                    metadata = None
+                
+                # Create BatchedDatapoint with correct structure
+                batched_datapoint = BatchedDatapoint(
+                    img_batch=image_tensor,
+                    find_text_batch=[],  # Empty list for no text prompts
+                    find_inputs=[find_stage],
+                    find_targets=[find_target] if find_target else [],
+                    find_metadatas=[metadata] if metadata else [],
+                    raw_images=[image_pil],  # Original PIL image
+                )
+                print(f"✓ BatchedDatapoint created successfully")
                 
                 with torch.no_grad():
                     print(f"Calling sam3_model.forward with BatchedDatapoint...")
@@ -676,7 +701,7 @@ async def segment_image_sam3d(request: SegmentSam3dRequest):
                 return JSONResponse(
                     status_code=500,
                     content={
-                        "error": f"SAM3 BatchedDatapoint import failed: {str(e)}",
+                        "error": f"SAM3 import failed: {str(e)}",
                         "message": "SAM3 model structure may have changed. Please check SAM3 documentation.",
                         "trace": error_trace
                     },
@@ -691,7 +716,7 @@ async def segment_image_sam3d(request: SegmentSam3dRequest):
                     content={
                         "error": f"SAM3 model forward call failed: {str(e)}",
                         "trace": error_trace,
-                        "message": "SAM3 model requires BatchedDatapoint. Please check SAM3 documentation for correct usage."
+                        "message": "SAM3 model requires BatchedDatapoint with specific structure. Please check SAM3 documentation for correct usage."
                     },
                 )
 
@@ -1094,9 +1119,9 @@ async def segment_image_binary_sam3d(request: SegmentBinarySam3dRequest):
 
         elif hasattr(sam3_model, 'forward') and sam3_processor is sam3_model:
             # Direct model API (no separate predictor)
-            # SAM3 uses BatchedDatapoint interface
+            # SAM3 uses BatchedDatapoint interface with specific structure
             try:
-                from sam3.model.data_misc import BatchedDatapoint
+                from sam3.model.data_misc import BatchedDatapoint, FindStage, BatchedFindTarget, BatchedInferenceMetadata
                 from torchvision.transforms import functional as TF
 
                 # Prepare image tensor
@@ -1105,14 +1130,47 @@ async def segment_image_binary_sam3d(request: SegmentBinarySam3dRequest):
 
                 for point in request.points:
                     # Normalize coordinates to [0, 1]
-                    point_coords_tensor = torch.tensor([[[point["x"] / w, point["y"] / h]]], dtype=torch.float32, device=device)
+                    point_coords_normalized = torch.tensor([[[point["x"] / w, point["y"] / h]]], dtype=torch.float32, device=device)
                     point_labels_tensor = torch.tensor([[1]], dtype=torch.int64, device=device)
+
+                    # Create FindStage for point prompts
+                    try:
+                        find_stage = FindStage(
+                            point_coords=point_coords_normalized[0],
+                            point_labels=point_labels_tensor[0],
+                        )
+                    except TypeError:
+                        try:
+                            find_stage = FindStage(
+                                coords=point_coords_normalized[0],
+                                labels=point_labels_tensor[0],
+                            )
+                        except TypeError:
+                            find_stage = FindStage()
+                            if hasattr(find_stage, 'point_coords'):
+                                find_stage.point_coords = point_coords_normalized[0]
+                            if hasattr(find_stage, 'point_labels'):
+                                find_stage.point_labels = point_labels_tensor[0]
+                    
+                    # Create BatchedFindTarget and BatchedInferenceMetadata
+                    try:
+                        find_target = BatchedFindTarget()
+                    except:
+                        find_target = None
+                    
+                    try:
+                        metadata = BatchedInferenceMetadata()
+                    except:
+                        metadata = None
 
                     # Create BatchedDatapoint
                     batched_datapoint = BatchedDatapoint(
-                        image=image_tensor,
-                        point_coords=point_coords_tensor,
-                        point_labels=point_labels_tensor,
+                        img_batch=image_tensor,
+                        find_text_batch=[],
+                        find_inputs=[find_stage],
+                        find_targets=[find_target] if find_target else [],
+                        find_metadatas=[metadata] if metadata else [],
+                        raw_images=[image_pil],
                     )
 
                     with torch.no_grad():
