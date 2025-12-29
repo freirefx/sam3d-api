@@ -2887,8 +2887,21 @@ async def video_propagate(request: VideoPropagateRequest):
                         masks_by_object[obj_id_str] = {}
                         scores_by_object[obj_id_str] = {}
                     
-                    # Get mask
-                    mask = obj_output.get("mask", obj_output.get("video_res_mask"))
+                    # obj_output can be:
+                    # - a dict with "mask" key
+                    # - a numpy.ndarray directly (the mask itself)
+                    # - a torch.Tensor directly
+                    mask = None
+                    score = 1.0
+                    
+                    if isinstance(obj_output, dict):
+                        mask = obj_output.get("mask", obj_output.get("video_res_mask"))
+                        score = obj_output.get("score", obj_output.get("obj_score", 1.0))
+                    elif isinstance(obj_output, np.ndarray):
+                        mask = obj_output
+                    elif isinstance(obj_output, torch.Tensor):
+                        mask = obj_output.cpu().numpy()
+                    
                     if mask is not None:
                         if isinstance(mask, torch.Tensor):
                             mask = mask.cpu().numpy()
@@ -2902,8 +2915,7 @@ async def video_propagate(request: VideoPropagateRequest):
                         buffer.seek(0)
                         masks_by_object[obj_id_str][str(frame_idx)] = base64.b64encode(buffer.getvalue()).decode("utf-8")
                     
-                    # Get score
-                    score = obj_output.get("score", obj_output.get("obj_score", 1.0))
+                    # Handle score
                     if isinstance(score, torch.Tensor):
                         score = score.item()
                     scores_by_object[obj_id_str][str(frame_idx)] = float(score)
