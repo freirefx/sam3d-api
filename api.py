@@ -270,48 +270,6 @@ def initialize_sam3_model():
                     except:
                         pass
                 
-                # Try to detect expected image size from model's positional encoding
-                # The RoPE freqs_cis has a specific shape that determines the expected sequence length
-                # Note: Different blocks may have different sizes (multi-scale architecture)
-                try:
-                    if hasattr(sam3_model, 'backbone') and hasattr(sam3_model.backbone, 'vision_backbone'):
-                        vision = sam3_model.backbone.vision_backbone
-                        if hasattr(vision, 'trunk'):
-                            detected_sizes = []
-                            for name, module in vision.trunk.named_modules():
-                                if hasattr(module, 'freqs_cis'):
-                                    freqs_shape = module.freqs_cis.shape
-                                    seq_len = freqs_shape[0] if len(freqs_shape) > 0 else None
-                                    if seq_len:
-                                        # Calculate image size: seq_len = (H/patch_size) * (W/patch_size)
-                                        # For square: H = sqrt(seq_len * 256)
-                                        patch_size = 16
-                                        estimated_size = int((seq_len * patch_size * patch_size) ** 0.5)
-                                        estimated_size = (estimated_size // patch_size) * patch_size
-                                        detected_sizes.append((seq_len, estimated_size, name))
-                            
-                            # Use the largest size found (likely the main resolution)
-                            if detected_sizes:
-                                detected_sizes.sort(key=lambda x: x[0], reverse=True)
-                                largest = detected_sizes[0]
-                                sam3_model._detected_seq_len = largest[0]
-                                sam3_model._estimated_image_size = largest[1]
-                                sam3_model._all_detected_sizes = detected_sizes
-                                print(f"  Detected {len(detected_sizes)} different freqs_cis sizes:")
-                                for seq_len, size, name in detected_sizes[:5]:  # Show first 5
-                                    print(f"    {name}: seq_len={seq_len}, size={size}x{size}")
-                                
-                                # Find smallest size for compatibility
-                                smallest = min(detected_sizes, key=lambda x: x[0])
-                                print(f"  Using smallest: {smallest[1]}x{smallest[1]} (seq_len={smallest[0]}) for compatibility")
-                                print(f"  Using largest: {largest[1]}x{largest[1]} (seq_len={largest[0]})")
-                                
-                                # Store both sizes
-                                sam3_model._estimated_image_size = largest[1]  # For reference
-                                sam3_model._smallest_detected_size = smallest[1]  # For actual use
-                except Exception as e:
-                    print(f"  Could not detect expected size: {e}")
-                
             except Exception as e1:
                 print(f"⚠ SAM 3 build_sam3_image_model failed: {e1}")
                 import traceback
@@ -663,127 +621,23 @@ async def segment_image_sam3d(request: SegmentSam3dRequest):
                 from torchvision.transforms import functional as TF
                 
                 # Prepare image tensor - SAM3 expects img_batch
-                # The RoPE positional encoding error suggests the model was initialized with a specific size
-                # Try using the original image size without resizing first
-                original_size = image_pil.size
-                original_w, original_h = original_size
-                
-                # Try to find the expected size from the model's freqs_cis
-                # The error shows freqs_cis has a specific shape that must match
-                expected_seq_len = None
-                if hasattr(sam3_model, 'backbone'):
-                    backbone = sam3_model.backbone
-                    if hasattr(backbone, 'vision_backbone'):
-                        vision = backbone.vision_backbone
-                        if hasattr(vision, 'trunk'):
-                            trunk = vision.trunk
-                            # Try to find a block with freqs_cis
-                            for name, module in trunk.named_modules():
-                                if hasattr(module, 'freqs_cis'):
-                                    freqs_shape = module.freqs_cis.shape
-                                    if len(freqs_shape) >= 2:
-                                        expected_seq_len = freqs_shape[0]  # Usually the sequence length
-                                        print(f"Found freqs_cis in {name} with shape {freqs_shape}, expected seq_len: {expected_seq_len}")
-                                        break
-                
-                # If we found expected_seq_len, calculate target image size
-                # Vision transformers typically have seq_len = (H/patch_size) * (W/patch_size)
-                # For SAM, patch_size is usually 16, so seq_len = (H/16) * (W/16) = H*W/256
-                if expected_seq_len:
-                    # Try to find a square size that matches
-                    # seq_len = (size/16)^2, so size = sqrt(seq_len * 256)
-                    estimated_size = int((expected_seq_len * 256) ** 0.5)
-                    # Round to nearest multiple of 16
-                    estimated_size = (estimated_size // 16) * 16
-                    print(f"Estimated image size from seq_len: {estimated_size}x{estimated_size}")
-                    # But this might not be correct if the model expects non-square images
-                
-                # Use smallest detected size for compatibility with all blocks
-                smallest_size = getattr(sam3_model, '_smallest_detected_size', None)
-                estimated_size = getattr(sam3_model, '_estimated_image_size', None)
-                
-                if smallest_size:
-                    # Use smallest size to ensure all blocks can handle it
-                    target_size = (smallest_size, smallest_size)
-                    print(f"Using smallest detected image size: {target_size} (for compatibility with all blocks)")
-                    image_pil_resized = image_pil.resize(target_size, Image.Resampling.LANCZOS)
-                    image_np = np.array(image_pil_resized)
-                    h, w = smallest_size, smallest_size
-                elif estimated_size:
-                    target_size = (estimated_size, estimated_size)
-                    print(f"Using detected image size: {target_size}")
-                    image_pil_resized = image_pil.resize(target_size, Image.Resampling.LANCZOS)
-                    image_np = np.array(image_pil_resized)
-                    h, w = estimated_size, estimated_size
-                else:
-                    # Try original size
-                    print(f"Using original image size: {original_size} (no resizing)")
-                    image_pil_resized = image_pil
-                    image_np = np.array(image_pil_resized)
-                    h, w = original_h, original_w
-                
-                # Convert to tensor: [C, H, W] then add batch dimension: [1, C, H, W]
-                image_tensor = TF.to_tensor(image_pil_resized).unsqueeze(0).to(device)
-                print(f"Image tensor shape: {image_tensor.shape}, dtype: {image_tensor.dtype}")
-                
-                # Calculate actual sequence length for this image
-                patch_size = 16
-                actual_seq_len = (h // patch_size) * (w // patch_size)
-                detected_seq_len = getattr(sam3_model, '_detected_seq_len', None)
-                if detected_seq_len:
-                    print(f"Sequence length: actual={actual_seq_len}, expected={detected_seq_len}, match={actual_seq_len == detected_seq_len}")
+                image_tensor = TF.to_tensor(image_pil).unsqueeze(0).to(device)
                 
                 # Prepare point prompts - normalize coordinates to [0, 1]
-                # If image was resized, we need to adjust coordinates
-                estimated_size = getattr(sam3_model, '_estimated_image_size', None)
-                if estimated_size and estimated_size != original_w and estimated_size != original_h:
-                    # Image was resized and possibly padded
-                    ratio = min(estimated_size / original_w, estimated_size / original_h)
-                    new_w = int(original_w * ratio)
-                    new_h = int(original_h * ratio)
-                    new_w = (new_w // 16) * 16
-                    new_h = (new_h // 16) * 16
-                    
-                    # Scale point coordinates
-                    scaled_x = request.x * (new_w / original_w)
-                    scaled_y = request.y * (new_h / original_h)
-                    
-                    # Add padding offset if image was padded
-                    paste_x = (estimated_size - new_w) // 2
-                    paste_y = (estimated_size - new_h) // 2
-                    scaled_x += paste_x
-                    scaled_y += paste_y
-                    
-                    # Normalize to [0, 1]
-                    point_coords_normalized = torch.tensor([[[scaled_x / estimated_size, scaled_y / estimated_size]]], dtype=torch.float32, device=device)
-                    print(f"Point coordinates: original=({request.x}, {request.y}), scaled=({scaled_x:.2f}, {scaled_y:.2f}), normalized=({scaled_x/estimated_size:.4f}, {scaled_y/estimated_size:.4f})")
-                else:
-                    # No resizing, use original coordinates
-                    point_coords_normalized = torch.tensor([[[request.x / w, request.y / h]]], dtype=torch.float32, device=device)
-                    print(f"Point coordinates: original=({request.x}, {request.y}), normalized=({request.x/w:.4f}, {request.y/h:.4f})")
-                point_labels_tensor = torch.tensor([[1]], dtype=torch.int64, device=device)
+                h, w = image_np.shape[:2]
+                # input_points: [batch, num_points, 2] - normalized coordinates
+                input_points = torch.tensor([[[request.x / w, request.y / h]]], dtype=torch.float32, device=device)  # [1, 1, 2]
+                # input_points_mask: [batch, num_points] - 1s for valid points
+                input_points_mask = torch.ones((1, 1), dtype=torch.bool, device=device)  # [1, 1]
                 
-                # Create FindStage for point prompts
-                # FindStage requires: img_ids, text_ids, input_boxes, input_boxes_mask, input_boxes_label, input_points, input_points_mask
-                # For point-based segmentation:
-                # - img_ids: [0] for single image
-                # - text_ids: empty tensor/list for no text prompts
-                # - input_boxes: empty for point-only segmentation
-                # - input_boxes_mask: empty
-                # - input_boxes_label: empty
-                # - input_points: point coordinates (normalized to [0,1])
-                # - input_points_mask: mask indicating which points are valid (all 1s for our case)
-                
+                # Create FindStage with all required fields
+                # FindStage requires: img_ids, text_ids, input_boxes, input_boxes_mask, 
+                # input_boxes_label, input_points, input_points_mask
                 img_ids = torch.tensor([0], dtype=torch.long, device=device)  # Single image, ID 0
                 text_ids = torch.empty((0,), dtype=torch.long, device=device)  # No text prompts
                 input_boxes = torch.empty((1, 0, 4), dtype=torch.float32, device=device)  # No boxes
                 input_boxes_mask = torch.zeros((1, 0), dtype=torch.bool, device=device)  # No boxes
                 input_boxes_label = torch.empty((1, 0), dtype=torch.long, device=device)  # No box labels
-                
-                # input_points: shape should be [batch, num_points, 2] - normalized coordinates
-                input_points = point_coords_normalized  # Already in shape [1, 1, 2]
-                # input_points_mask: shape [batch, num_points] - 1 for valid points
-                input_points_mask = torch.ones((1, 1), dtype=torch.bool, device=device)
                 
                 find_stage = FindStage(
                     img_ids=img_ids,
@@ -799,13 +653,15 @@ async def segment_image_sam3d(request: SegmentSam3dRequest):
                 # Create BatchedFindTarget (likely empty for segmentation)
                 try:
                     find_target = BatchedFindTarget()
-                except:
+                except Exception as e:
+                    print(f"⚠ BatchedFindTarget creation failed: {e}, using None")
                     find_target = None
                 
                 # Create BatchedInferenceMetadata
                 try:
                     metadata = BatchedInferenceMetadata()
-                except:
+                except Exception as e:
+                    print(f"⚠ BatchedInferenceMetadata creation failed: {e}, using None")
                     metadata = None
                 
                 # Create BatchedDatapoint with correct structure
@@ -819,203 +675,18 @@ async def segment_image_sam3d(request: SegmentSam3dRequest):
                 )
                 print(f"✓ BatchedDatapoint created successfully")
                 
-                # Before calling the model, try to update freqs_cis for the actual image size
-                # The RoPE positional encoding needs to match the input dimensions
-                try:
-                    if hasattr(sam3_model, 'backbone') and hasattr(sam3_model.backbone, 'vision_backbone'):
-                        vision = sam3_model.backbone.vision_backbone
-                        if hasattr(vision, 'trunk'):
-                            # Calculate actual sequence dimensions
-                            patch_size = 16
-                            H_p = h // patch_size
-                            W_p = w // patch_size
-                            
-                            print(f"Attempting to update freqs_cis for image size {h}x{w} (patches: {H_p}x{W_p})")
-                            
-                            # Try to find and update freqs_cis in attention modules
-                            for name, module in vision.trunk.named_modules():
-                                if hasattr(module, 'freqs_cis') and hasattr(module, 'head_dim'):
-                                    try:
-                                        # Try to compute new freqs_cis
-                                        # This is a simplified approach - may need the actual compute_axial_cis function
-                                        current_freqs = module.freqs_cis
-                                        expected_seq_len = H_p * W_p
-                                        
-                                        # Only update if size doesn't match
-                                        if current_freqs.shape[0] != expected_seq_len:
-                                            print(f"  Updating freqs_cis in {name}: {current_freqs.shape[0]} -> {expected_seq_len}")
-                                            # Try to use the model's own method if available
-                                            try:
-                                                import inspect
-                                                if hasattr(module, '_setup_rope_freqs'):
-                                                    sig = inspect.signature(module._setup_rope_freqs)
-                                                    print(f"    _setup_rope_freqs signature: {sig}")
-                                                    
-                                                    # Try setting attributes first, then calling
-                                                    if hasattr(module, 'rope_pt_size'):
-                                                        # Set the patch size first
-                                                        module.rope_pt_size = (H_p, W_p)
-                                                        print(f"    Set rope_pt_size to ({H_p}, {W_p})")
-                                                    
-                                                    # Try calling with input_size parameter (if supported) or without args
-                                                    try:
-                                                        old_shape = module.freqs_cis.shape if hasattr(module, 'freqs_cis') and module.freqs_cis is not None else None
-                                                        
-                                                        # Try calling with input_size first (patch dimensions)
-                                                        import inspect
-                                                        sig = inspect.signature(module._setup_rope_freqs)
-                                                        if len(sig.parameters) > 0 and 'input_size' in sig.parameters:
-                                                            # Method accepts input_size parameter
-                                                            module._setup_rope_freqs(input_size=(H_p, W_p))
-                                                            print(f"    Called _setup_rope_freqs with input_size=({H_p}, {W_p})")
-                                                        else:
-                                                            # Method doesn't accept parameters, uses rope_pt_size attribute
-                                                            module._setup_rope_freqs()
-                                                            print(f"    Called _setup_rope_freqs() (no params)")
-                                                        
-                                                        # Ensure freqs_cis is on the same device as the model
-                                                        if hasattr(module, 'freqs_cis') and module.freqs_cis is not None:
-                                                            current_device = next(sam3_model.parameters()).device
-                                                            new_shape = module.freqs_cis.shape
-                                                            if module.freqs_cis.device != current_device:
-                                                                module.freqs_cis = module.freqs_cis.to(device=current_device)
-                                                            
-                                                            # Check if shape was actually updated
-                                                            if len(new_shape) >= 1 and new_shape[0] != expected_seq_len:
-                                                                print(f"    ⚠ Shape not updated by _setup_rope_freqs (still {new_shape[0]}, need {expected_seq_len}), manually computing...")
-                                                                # Manually compute freqs_cis
-                                                                try:
-                                                                    from sam3.model.vitdet import compute_axial_cis
-                                                                    head_dim = module.head_dim
-                                                                    rope_theta = getattr(module, 'rope_theta', 10000.0)
-                                                                    
-                                                                    # Compute freqs_cis - it returns a complex tensor
-                                                                    new_freqs = compute_axial_cis(
-                                                                        end_x=H_p,
-                                                                        end_y=W_p,
-                                                                        dim=head_dim,
-                                                                        theta=rope_theta,
-                                                                    )
-                                                                    
-                                                                    # Check the original dtype of freqs_cis
-                                                                    original_dtype = module.freqs_cis.dtype if hasattr(module, 'freqs_cis') and module.freqs_cis is not None else torch.complex64
-                                                                    
-                                                                    # Move to device and convert to appropriate dtype
-                                                                    new_freqs = new_freqs.to(device=current_device)
-                                                                    # Keep complex dtype if that's what the module expects
-                                                                    if original_dtype.is_complex:
-                                                                        # Keep as complex
-                                                                        pass
-                                                                    else:
-                                                                        # Convert to real (this will discard imaginary part, but that's what we were doing)
-                                                                        new_freqs = new_freqs.to(dtype=original_dtype)
-                                                                    
-                                                                    module.freqs_cis = new_freqs
-                                                                    print(f"    ✓ Manually computed freqs_cis: {new_freqs.shape}, dtype: {new_freqs.dtype}")
-                                                                except ImportError:
-                                                                    try:
-                                                                        from sam3.sam3.model.vitdet import compute_axial_cis
-                                                                        head_dim = module.head_dim
-                                                                        rope_theta = getattr(module, 'rope_theta', 10000.0)
-                                                                        new_freqs = compute_axial_cis(
-                                                                            end_x=H_p,
-                                                                            end_y=W_p,
-                                                                            dim=head_dim,
-                                                                            theta=rope_theta,
-                                                                        ).to(device=current_device, dtype=torch.float32)
-                                                                        module.freqs_cis = new_freqs
-                                                                        print(f"    ✓ Manually computed freqs_cis (alt import): {new_freqs.shape}")
-                                                                    except Exception as e_alt:
-                                                                        print(f"    ✗ Could not compute freqs_cis manually: {e_alt}")
-                                                                except Exception as e2:
-                                                                    print(f"    ✗ Error computing freqs_cis: {e2}")
-                                                            else:
-                                                                print(f"    ✓ freqs_cis shape correct: {new_shape}")
-                                                        print(f"    ✓ Called _setup_rope_freqs() successfully")
-                                                    except Exception as e_call:
-                                                        print(f"    _setup_rope_freqs() failed: {e_call}")
-                                                    
-                                                    # Check if shape was actually updated, if not, manually compute
-                                                    if hasattr(module, 'freqs_cis') and module.freqs_cis is not None:
-                                                        current_shape = module.freqs_cis.shape
-                                                        if len(current_shape) >= 1 and current_shape[0] != expected_seq_len:
-                                                            print(f"    Shape not updated by _setup_rope_freqs, manually computing...")
-                                                            # Try alternative: manually compute and set freqs_cis
-                                                            try:
-                                                                # Try to import the compute function from SAM3
-                                                                from sam3.model.vitdet import compute_axial_cis
-                                                                head_dim = module.head_dim
-                                                                rope_theta = getattr(module, 'rope_theta', 10000.0)
-                                                                
-                                                                # Compute new freqs_cis
-                                                                new_freqs = compute_axial_cis(
-                                                                    end_x=H_p,
-                                                                    end_y=W_p,
-                                                                    dim=head_dim,
-                                                                    theta=rope_theta,
-                                                                ).to(device=current_device, dtype=torch.float32)
-                                                                
-                                                                module.freqs_cis = new_freqs
-                                                                print(f"    ✓ Manually computed and set freqs_cis: {new_freqs.shape}")
-                                                            except ImportError as ie:
-                                                                print(f"    Cannot import compute_axial_cis: {ie}")
-                                                                # Try to find it in a different location
-                                                                try:
-                                                                    from sam3.sam3.model.vitdet import compute_axial_cis
-                                                                    head_dim = module.head_dim
-                                                                    rope_theta = getattr(module, 'rope_theta', 10000.0)
-                                                                    new_freqs = compute_axial_cis(
-                                                                        end_x=H_p,
-                                                                        end_y=W_p,
-                                                                        dim=head_dim,
-                                                                        theta=rope_theta,
-                                                                    ).to(device=current_device, dtype=torch.float32)
-                                                                    module.freqs_cis = new_freqs
-                                                                    print(f"    ✓ Found compute_axial_cis in alternative location: {new_freqs.shape}")
-                                                                except Exception as e_alt:
-                                                                    print(f"    Could not find compute_axial_cis function: {e_alt}")
-                                                            except Exception as e2:
-                                                                print(f"    Could not manually compute freqs_cis: {e2}")
-                                                else:
-                                                    print(f"    No _setup_rope_freqs method available")
-                                            except Exception as e:
-                                                print(f"    Error in freqs_cis update: {e}")
-                                    except Exception as e:
-                                        print(f"    Could not update freqs_cis in {name}: {e}")
-                except Exception as e:
-                    print(f"Warning: Could not update freqs_cis: {e}")
-                
-                # Final verification: ensure all freqs_cis are on the correct device and have correct shape
-                try:
-                    current_device = next(sam3_model.parameters()).device
-                    patch_size = 16
-                    expected_seq_len = (h // patch_size) * (w // patch_size)
-                    print(f"Final verification: expected_seq_len={expected_seq_len} for image {h}x{w}")
-                    
-                    if hasattr(sam3_model, 'backbone') and hasattr(sam3_model.backbone, 'vision_backbone'):
-                        vision = sam3_model.backbone.vision_backbone
-                        if hasattr(vision, 'trunk'):
-                            for name, module in vision.trunk.named_modules():
-                                if hasattr(module, 'freqs_cis') and module.freqs_cis is not None:
-                                    if module.freqs_cis.device != current_device:
-                                        module.freqs_cis = module.freqs_cis.to(device=current_device)
-                                        print(f"Final fix: Moved {name}.freqs_cis to {current_device}")
-                                    
-                                    # Check shape
-                                    freqs_shape = module.freqs_cis.shape
-                                    if len(freqs_shape) >= 1:
-                                        freqs_seq_len = freqs_shape[0]
-                                        if freqs_seq_len != expected_seq_len:
-                                            print(f"Warning: {name}.freqs_cis has seq_len={freqs_seq_len}, expected {expected_seq_len}")
-                                        else:
-                                            print(f"✓ {name}.freqs_cis has correct seq_len={freqs_seq_len}")
-                except Exception as e:
-                    print(f"Warning: Final freqs_cis device check failed: {e}")
-                
                 with torch.no_grad():
                     print(f"Calling sam3_model.forward with BatchedDatapoint...")
                     outputs = sam3_model(batched_datapoint)
                     print(f"✓ Model forward call successful, output type: {type(outputs)}")
+                    if hasattr(outputs, '__dict__'):
+                        print(f"  Output attributes: {list(outputs.__dict__.keys())}")
+                    elif isinstance(outputs, dict):
+                        print(f"  Output keys: {list(outputs.keys())}")
+                    elif isinstance(outputs, (list, tuple)):
+                        print(f"  Output length: {len(outputs)}")
+                        for i, item in enumerate(outputs):
+                            print(f"    Item {i}: type={type(item)}, shape={getattr(item, 'shape', 'N/A') if hasattr(item, 'shape') else 'N/A'}")
                     
             except ImportError as e:
                 import traceback
@@ -1029,27 +700,6 @@ async def segment_image_sam3d(request: SegmentSam3dRequest):
                         "trace": error_trace
                     },
                 )
-            except AssertionError as e:
-                # This is likely the RoPE positional encoding error
-                import traceback
-                error_trace = traceback.format_exc()
-                print(f"✗ SAM3 RoPE positional encoding error: {error_trace}")
-                return JSONResponse(
-                    status_code=500,
-                    content={
-                        "error": "SAM3 model has incompatible image size requirements",
-                        "details": str(e),
-                        "message": (
-                            "SAM3 uses a multi-scale architecture with fixed positional encodings. "
-                            "The model was initialized with specific image sizes that don't match the input. "
-                            "This is a known limitation of SAM3 for static image segmentation. "
-                            "Please use SAM2 (/segment or /segment-binary) for image segmentation, "
-                            "or ensure the image size matches one of the model's expected sizes."
-                        ),
-                        "detected_sizes": getattr(sam3_model, '_all_detected_sizes', []),
-                        "suggestion": "Use /api/sam3d/segment (SAM2) instead of /api/sam3d/segment-sam3d"
-                    },
-                )
             except Exception as e:
                 # Fallback: try to understand the error and provide helpful message
                 import traceback
@@ -1060,11 +710,7 @@ async def segment_image_sam3d(request: SegmentSam3dRequest):
                     content={
                         "error": f"SAM3 model forward call failed: {str(e)}",
                         "trace": error_trace,
-                        "message": (
-                            "SAM3 model requires BatchedDatapoint with specific structure. "
-                            "SAM3 may have limitations for static image segmentation. "
-                            "Consider using SAM2 (/segment or /segment-binary) for image segmentation."
-                        )
+                        "message": "SAM3 model requires BatchedDatapoint with specific structure. Please check SAM3 documentation for correct usage."
                     },
                 )
 
@@ -1073,23 +719,31 @@ async def segment_image_sam3d(request: SegmentSam3dRequest):
             masks = None
             scores = None
             
+            print(f"Attempting to extract masks from output type: {type(outputs)}")
+            
             if isinstance(outputs, dict):
+                print(f"  Output is dict, keys: {list(outputs.keys())}")
                 masks = outputs.get("masks", outputs.get("pred_masks", outputs.get("mask", None)))
                 scores = outputs.get("iou_predictions", outputs.get("scores", outputs.get("iou_scores", None)))
             elif hasattr(outputs, 'masks'):
+                print(f"  Output has 'masks' attribute")
                 masks = outputs.masks
                 scores = getattr(outputs, 'scores', None) or getattr(outputs, 'iou_scores', None)
             elif isinstance(outputs, (list, tuple)):
+                print(f"  Output is list/tuple, length: {len(outputs)}")
                 masks = outputs[0] if len(outputs) > 0 else None
                 scores = outputs[1] if len(outputs) > 1 else None
             elif isinstance(outputs, torch.Tensor):
+                print(f"  Output is Tensor, shape: {outputs.shape}")
                 masks = outputs
             else:
                 # Try to access as attribute
+                print(f"  Trying to access as attributes")
                 masks = getattr(outputs, 'masks', None) or getattr(outputs, 'pred_masks', None)
                 scores = getattr(outputs, 'scores', None) or getattr(outputs, 'iou_scores', None)
 
             if masks is not None:
+                print(f"✓ Masks extracted, type: {type(masks)}, shape: {getattr(masks, 'shape', 'N/A') if hasattr(masks, 'shape') else 'N/A'}")
                 if isinstance(masks, torch.Tensor):
                     masks = masks.cpu().numpy()
                 masks = np.squeeze(masks)
@@ -1472,51 +1126,23 @@ async def segment_image_binary_sam3d(request: SegmentBinarySam3dRequest):
                 from sam3.model.data_misc import BatchedDatapoint, FindStage, BatchedFindTarget, BatchedInferenceMetadata
                 from torchvision.transforms import functional as TF
 
-                # Prepare image tensor - resize if needed
-                original_size = image_pil.size
-                original_w, original_h = original_size
-                max_size = 1024
-                
-                if max(original_size) > max_size:
-                    ratio = max_size / max(original_size)
-                    new_w = int(original_w * ratio)
-                    new_h = int(original_h * ratio)
-                    image_pil_resized = image_pil.resize((new_w, new_h), Image.Resampling.LANCZOS)
-                    image_np = np.array(image_pil_resized)
-                    h, w = new_h, new_w
-                else:
-                    image_pil_resized = image_pil
-                    h, w = original_h, original_w
-                
-                image_tensor = TF.to_tensor(image_pil_resized).unsqueeze(0).to(device)
+                # Prepare image tensor
+                image_tensor = TF.to_tensor(image_pil).unsqueeze(0).to(device)
+                h, w = image_np.shape[:2]
 
                 for point in request.points:
-                    # Scale points if image was resized
-                    if max(original_size) > max_size:
-                        scale_x = w / original_w
-                        scale_y = h / original_h
-                        scaled_x = point["x"] * scale_x
-                        scaled_y = point["y"] * scale_y
-                    else:
-                        scaled_x = point["x"]
-                        scaled_y = point["y"]
-                    
                     # Normalize coordinates to [0, 1]
-                    point_coords_normalized = torch.tensor([[[scaled_x / w, scaled_y / h]]], dtype=torch.float32, device=device)
-                    point_labels_tensor = torch.tensor([[1]], dtype=torch.int64, device=device)
+                    # input_points: [batch, num_points, 2] - normalized coordinates
+                    input_points = torch.tensor([[[point["x"] / w, point["y"] / h]]], dtype=torch.float32, device=device)  # [1, 1, 2]
+                    # input_points_mask: [batch, num_points] - 1s for valid points
+                    input_points_mask = torch.ones((1, 1), dtype=torch.bool, device=device)  # [1, 1]
 
-                    # Create FindStage for point prompts
-                    # FindStage requires all fields
-                    img_ids = torch.tensor([0], dtype=torch.long, device=device)
-                    text_ids = torch.empty((0,), dtype=torch.long, device=device)
-                    input_boxes = torch.empty((1, 0, 4), dtype=torch.float32, device=device)
-                    input_boxes_mask = torch.zeros((1, 0), dtype=torch.bool, device=device)
-                    input_boxes_label = torch.empty((1, 0), dtype=torch.long, device=device)
-                    
-                    # input_points: shape [batch, num_points, 2]
-                    input_points = point_coords_normalized
-                    # input_points_mask: shape [batch, num_points]
-                    input_points_mask = torch.ones((1, 1), dtype=torch.bool, device=device)
+                    # Create FindStage with all required fields
+                    img_ids = torch.tensor([0], dtype=torch.long, device=device)  # Single image, ID 0
+                    text_ids = torch.empty((0,), dtype=torch.long, device=device)  # No text prompts
+                    input_boxes = torch.empty((1, 0, 4), dtype=torch.float32, device=device)  # No boxes
+                    input_boxes_mask = torch.zeros((1, 0), dtype=torch.bool, device=device)  # No boxes
+                    input_boxes_label = torch.empty((1, 0), dtype=torch.long, device=device)  # No box labels
                     
                     find_stage = FindStage(
                         img_ids=img_ids,
@@ -1531,12 +1157,14 @@ async def segment_image_binary_sam3d(request: SegmentBinarySam3dRequest):
                     # Create BatchedFindTarget and BatchedInferenceMetadata
                     try:
                         find_target = BatchedFindTarget()
-                    except:
+                    except Exception as e:
+                        print(f"⚠ BatchedFindTarget creation failed: {e}, using None")
                         find_target = None
                     
                     try:
                         metadata = BatchedInferenceMetadata()
-                    except:
+                    except Exception as e:
+                        print(f"⚠ BatchedInferenceMetadata creation failed: {e}, using None")
                         metadata = None
 
                     # Create BatchedDatapoint
@@ -1550,7 +1178,15 @@ async def segment_image_binary_sam3d(request: SegmentBinarySam3dRequest):
                     )
 
                     with torch.no_grad():
+                        print(f"Calling sam3_model.forward with BatchedDatapoint for point ({point['x']}, {point['y']})...")
                         outputs = sam3_model(batched_datapoint)
+                        print(f"✓ Model forward call successful, output type: {type(outputs)}")
+                        if hasattr(outputs, '__dict__'):
+                            print(f"  Output attributes: {list(outputs.__dict__.keys())}")
+                        elif isinstance(outputs, dict):
+                            print(f"  Output keys: {list(outputs.keys())}")
+                        elif isinstance(outputs, (list, tuple)):
+                            print(f"  Output length: {len(outputs)}")
 
                     # Extract masks from output
                     masks = None
@@ -1602,27 +1238,6 @@ async def segment_image_binary_sam3d(request: SegmentBinarySam3dRequest):
                         "message": "SAM3 model structure may have changed. Please check SAM3 documentation."
                     },
                 )
-            except AssertionError as e:
-                # This is likely the RoPE positional encoding error
-                import traceback
-                error_trace = traceback.format_exc()
-                print(f"✗ SAM3 RoPE positional encoding error: {error_trace}")
-                return JSONResponse(
-                    status_code=500,
-                    content={
-                        "error": "SAM3 model has incompatible image size requirements",
-                        "details": str(e),
-                        "message": (
-                            "SAM3 uses a multi-scale architecture with fixed positional encodings. "
-                            "The model was initialized with specific image sizes that don't match the input. "
-                            "This is a known limitation of SAM3 for static image segmentation. "
-                            "Please use SAM2 (/segment-binary) for image segmentation, "
-                            "or ensure the image size matches one of the model's expected sizes."
-                        ),
-                        "detected_sizes": getattr(sam3_model, '_all_detected_sizes', []),
-                        "suggestion": "Use /api/sam3d/segment-binary (SAM2) instead of /api/sam3d/segment-binary-sam3d"
-                    },
-                )
             except Exception as e:
                 import traceback
                 error_trace = traceback.format_exc()
@@ -1631,11 +1246,7 @@ async def segment_image_binary_sam3d(request: SegmentBinarySam3dRequest):
                     status_code=500,
                     content={
                         "error": f"SAM3 model forward call failed: {str(e)}",
-                        "message": (
-                            "SAM3 model requires BatchedDatapoint. "
-                            "SAM3 may have limitations for static image segmentation. "
-                            "Consider using SAM2 (/segment-binary) for image segmentation."
-                        )
+                        "message": "SAM3 model requires BatchedDatapoint. Please check SAM3 documentation for correct usage."
                     },
                 )
 
