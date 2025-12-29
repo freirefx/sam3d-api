@@ -2863,47 +2863,63 @@ async def video_propagate(request: VideoPropagateRequest):
         propagate_request = {
             "type": "propagate_in_video",
             "session_id": predictor_session_id,
-            "start_frame": request.start_frame,
         }
+        if request.start_frame != 0:
+            propagate_request["start_frame"] = request.start_frame
         if request.max_frame is not None:
             propagate_request["max_frame"] = request.max_frame
 
-        # Call predictor
-        if hasattr(sam3_video_predictor, 'handle_request'):
-            response = sam3_video_predictor.handle_request(propagate_request)
-
-            # Process masks - encode each to base64
-            masks_encoded = {}
-            scores_output = {}
-
-            if "masks" in response:
-                for obj_id, frame_masks in response["masks"].items():
-                    masks_encoded[str(obj_id)] = {}
-                    for frame_idx, mask in frame_masks.items():
+        # Use handle_stream_request for propagation (it's a streaming/generator API)
+        if hasattr(sam3_video_predictor, 'handle_stream_request'):
+            masks_by_object = {}
+            scores_by_object = {}
+            frames_processed = 0
+            
+            # handle_stream_request returns a generator
+            for response in sam3_video_predictor.handle_stream_request(request=propagate_request):
+                frame_idx = response.get("frame_index", response.get("frame_idx", frames_processed))
+                outputs = response.get("outputs", {})
+                
+                # Process outputs for each object
+                for obj_id, obj_output in outputs.items():
+                    obj_id_str = str(obj_id)
+                    if obj_id_str not in masks_by_object:
+                        masks_by_object[obj_id_str] = {}
+                        scores_by_object[obj_id_str] = {}
+                    
+                    # Get mask
+                    mask = obj_output.get("mask", obj_output.get("video_res_mask"))
+                    if mask is not None:
                         if isinstance(mask, torch.Tensor):
                             mask = mask.cpu().numpy()
                         mask = np.squeeze(mask)
                         mask = (mask > 0).astype(np.uint8) * 255
+                        
+                        # Encode to base64
                         mask_image = Image.fromarray(mask, mode="L")
                         buffer = io.BytesIO()
                         mask_image.save(buffer, format="PNG")
                         buffer.seek(0)
-                        masks_encoded[str(obj_id)][str(frame_idx)] = base64.b64encode(buffer.getvalue()).decode("utf-8")
-
-            if "scores" in response:
-                for obj_id, frame_scores in response["scores"].items():
-                    scores_output[str(obj_id)] = {str(k): float(v) for k, v in frame_scores.items()}
+                        masks_by_object[obj_id_str][str(frame_idx)] = base64.b64encode(buffer.getvalue()).decode("utf-8")
+                    
+                    # Get score
+                    score = obj_output.get("score", obj_output.get("obj_score", 1.0))
+                    if isinstance(score, torch.Tensor):
+                        score = score.item()
+                    scores_by_object[obj_id_str][str(frame_idx)] = float(score)
+                
+                frames_processed += 1
 
             return JSONResponse({
                 "success": True,
-                "masks": masks_encoded,
-                "scores": scores_output,
-                "num_frames_processed": len(next(iter(masks_encoded.values()), {})) if masks_encoded else 0,
+                "masks": masks_by_object,
+                "scores": scores_by_object,
+                "num_frames_processed": frames_processed,
             })
         else:
             return JSONResponse(
                 status_code=501,
-                content={"error": "Video predictor does not support propagate."},
+                content={"error": "Video predictor does not support handle_stream_request for propagation."},
             )
 
     except Exception as e:
