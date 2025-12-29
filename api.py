@@ -684,13 +684,95 @@ async def segment_image_sam3d(request: SegmentSam3dRequest):
                 from sam3.model.data_misc import BatchedDatapoint, FindStage, BatchedFindTarget, BatchedInferenceMetadata
                 from torchvision.transforms import functional as TF
                 
+                # SAM3 has fixed image size requirements due to RoPE positional encoding
+                # Need to detect expected size and resize image
+                # Store original size for later mask resizing
+                original_h, original_w = image_np.shape[:2]
+                expected_size = None
+                new_h = None
+                new_w = None
+                
+                # Try to detect expected size from model's freqs_cis
+                try:
+                    if hasattr(sam3_model, 'backbone') and hasattr(sam3_model.backbone, 'vision_backbone'):
+                        vision = sam3_model.backbone.vision_backbone
+                        if hasattr(vision, 'trunk'):
+                            # Find first block with freqs_cis to get expected sequence length
+                            for name, module in vision.trunk.named_modules():
+                                if hasattr(module, 'freqs_cis') and module.freqs_cis is not None:
+                                    freqs_shape = module.freqs_cis.shape
+                                    if len(freqs_shape) >= 1:
+                                        expected_seq_len = freqs_shape[0]
+                                        # Calculate image size: seq_len = (H/patch_size) * (W/patch_size)
+                                        # For SAM3, patch_size is typically 16
+                                        patch_size = 16
+                                        # Assuming square images: seq_len = (size/16)^2
+                                        expected_size = int((expected_seq_len * patch_size * patch_size) ** 0.5)
+                                        # Round to nearest multiple of patch_size
+                                        expected_size = (expected_size // patch_size) * patch_size
+                                        print(f"Detected expected image size from freqs_cis: {expected_size}x{expected_size} (seq_len={expected_seq_len})")
+                                        break
+                except Exception as e:
+                    print(f"Could not detect expected size: {e}")
+                
+                # Default to common SAM3 sizes if detection failed
+                if expected_size is None:
+                    # Common SAM3 image sizes: 1024, 1280, 1536
+                    expected_size = 1024
+                    print(f"Using default expected size: {expected_size}x{expected_size}")
+                
+                # Resize image to expected size (maintaining aspect ratio, then pad/crop to square)
+                paste_x = 0
+                paste_y = 0
+                
+                if original_w != expected_size or original_h != expected_size:
+                    # Calculate resize ratio to fit image in expected_size square
+                    ratio = min(expected_size / original_w, expected_size / original_h)
+                    new_w = int(original_w * ratio)
+                    new_h = int(original_h * ratio)
+                    # Round to multiple of patch_size (16)
+                    new_w = (new_w // 16) * 16
+                    new_h = (new_h // 16) * 16
+                    
+                    # Resize image
+                    image_pil_resized = image_pil.resize((new_w, new_h), Image.Resampling.LANCZOS)
+                    # Pad to square if needed
+                    if new_w != expected_size or new_h != expected_size:
+                        # Create square image with padding
+                        square_image = Image.new('RGB', (expected_size, expected_size), (0, 0, 0))
+                        # Center the resized image
+                        paste_x = (expected_size - new_w) // 2
+                        paste_y = (expected_size - new_h) // 2
+                        square_image.paste(image_pil_resized, (paste_x, paste_y))
+                        image_pil_resized = square_image
+                    
+                    print(f"Resized image from {original_w}x{original_h} to {expected_size}x{expected_size}")
+                    h, w = expected_size, expected_size
+                    
+                    # Adjust point coordinates for resized image
+                    # First scale by ratio
+                    scaled_x = request.x * ratio
+                    scaled_y = request.y * ratio
+                    # Then add padding offset
+                    scaled_x += paste_x
+                    scaled_y += paste_y
+                    # Normalize to [0, 1]
+                    point_x_norm = scaled_x / expected_size
+                    point_y_norm = scaled_y / expected_size
+                    print(f"Point coordinates: original=({request.x}, {request.y}), scaled=({scaled_x:.1f}, {scaled_y:.1f}), normalized=({point_x_norm:.4f}, {point_y_norm:.4f})")
+                else:
+                    image_pil_resized = image_pil
+                    h, w = original_h, original_w
+                    point_x_norm = request.x / w
+                    point_y_norm = request.y / h
+                    print(f"Image already at expected size, using original coordinates")
+                
                 # Prepare image tensor - SAM3 expects img_batch
-                image_tensor = TF.to_tensor(image_pil).unsqueeze(0).to(device)
+                image_tensor = TF.to_tensor(image_pil_resized).unsqueeze(0).to(device)
                 
                 # Prepare point prompts - normalize coordinates to [0, 1]
-                h, w = image_np.shape[:2]
                 # input_points: [batch, num_points, 2] - normalized coordinates
-                input_points = torch.tensor([[[request.x / w, request.y / h]]], dtype=torch.float32, device=device)  # [1, 1, 2]
+                input_points = torch.tensor([[[point_x_norm, point_y_norm]]], dtype=torch.float32, device=device)  # [1, 1, 2]
                 # input_points_mask: [batch, num_points] - 1s for valid points
                 input_points_mask = torch.ones((1, 1), dtype=torch.bool, device=device)  # [1, 1]
                 
@@ -874,6 +956,16 @@ async def segment_image_sam3d(request: SegmentSam3dRequest):
                 for i in range(len(masks)):
                     mask = masks[i]
                     mask = (mask > request.mask_threshold).astype(np.uint8) * 255
+                    
+                    # Resize mask back to original image size if image was resized
+                    # Note: original_h, original_w are from image_np.shape at function start
+                    # w, h are the processed image dimensions (may be resized)
+                    if hasattr(image_np, 'shape'):
+                        orig_h, orig_w = image_np.shape[:2]
+                        if orig_w != mask.shape[1] or orig_h != mask.shape[0]:
+                            # Resize mask back to original size
+                            mask = cv2.resize(mask, (orig_w, orig_h), interpolation=cv2.INTER_NEAREST)
+                            print(f"Resized mask from {mask.shape[1]}x{mask.shape[0]} back to {orig_w}x{orig_h}")
 
                     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
                     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
