@@ -270,6 +270,31 @@ def initialize_sam3_model():
                     except:
                         pass
                 
+                # Try to detect expected image size from model's positional encoding
+                # The RoPE freqs_cis has a specific shape that determines the expected sequence length
+                try:
+                    if hasattr(sam3_model, 'backbone') and hasattr(sam3_model.backbone, 'vision_backbone'):
+                        vision = sam3_model.backbone.vision_backbone
+                        if hasattr(vision, 'trunk'):
+                            for name, module in vision.trunk.named_modules():
+                                if hasattr(module, 'freqs_cis'):
+                                    freqs_shape = module.freqs_cis.shape
+                                    print(f"  Found freqs_cis in {name}: shape {freqs_shape}")
+                                    # Store this info for later use
+                                    if not hasattr(sam3_model, '_detected_seq_len'):
+                                        sam3_model._detected_seq_len = freqs_shape[0] if len(freqs_shape) > 0 else None
+                                        sam3_model._freqs_cis_shape = freqs_shape
+                                        # Calculate expected image size
+                                        # seq_len = (H/patch_size) * (W/patch_size), patch_size=16 for SAM
+                                        # For square: H=W, seq_len = H²/256, so H = sqrt(seq_len * 256)
+                                        if sam3_model._detected_seq_len:
+                                            estimated_size = int((sam3_model._detected_seq_len * 256) ** 0.5)
+                                            estimated_size = (estimated_size // 16) * 16  # Round to multiple of 16
+                                            sam3_model._estimated_image_size = estimated_size
+                                            print(f"  Estimated image size: {estimated_size}x{estimated_size}")
+                except Exception as e:
+                    print(f"  Could not detect expected size: {e}")
+                
             except Exception as e1:
                 print(f"⚠ SAM 3 build_sam3_image_model failed: {e1}")
                 import traceback
@@ -621,54 +646,71 @@ async def segment_image_sam3d(request: SegmentSam3dRequest):
                 from torchvision.transforms import functional as TF
                 
                 # Prepare image tensor - SAM3 expects img_batch
-                # The model may have been trained with a specific image size
-                # Try to use a fixed size that the model expects (common: 1024x1024)
+                # The RoPE positional encoding error suggests the model was initialized with a specific size
+                # Try using the original image size without resizing first
                 original_size = image_pil.size
                 original_w, original_h = original_size
                 
-                # Check if model has expected image size attribute
-                expected_size = None
-                if hasattr(sam3_model, 'image_size'):
-                    expected_size = sam3_model.image_size
-                elif hasattr(sam3_model, 'img_size'):
-                    expected_size = sam3_model.img_size
-                elif hasattr(sam3_model, 'backbone') and hasattr(sam3_model.backbone, 'image_size'):
-                    expected_size = sam3_model.backbone.image_size
+                # Try to find the expected size from the model's freqs_cis
+                # The error shows freqs_cis has a specific shape that must match
+                expected_seq_len = None
+                if hasattr(sam3_model, 'backbone'):
+                    backbone = sam3_model.backbone
+                    if hasattr(backbone, 'vision_backbone'):
+                        vision = backbone.vision_backbone
+                        if hasattr(vision, 'trunk'):
+                            trunk = vision.trunk
+                            # Try to find a block with freqs_cis
+                            for name, module in trunk.named_modules():
+                                if hasattr(module, 'freqs_cis'):
+                                    freqs_shape = module.freqs_cis.shape
+                                    if len(freqs_shape) >= 2:
+                                        expected_seq_len = freqs_shape[0]  # Usually the sequence length
+                                        print(f"Found freqs_cis in {name} with shape {freqs_shape}, expected seq_len: {expected_seq_len}")
+                                        break
                 
-                if expected_size:
-                    target_size = expected_size if isinstance(expected_size, (tuple, list)) else (expected_size, expected_size)
-                    print(f"Model expects image size: {target_size}")
+                # If we found expected_seq_len, calculate target image size
+                # Vision transformers typically have seq_len = (H/patch_size) * (W/patch_size)
+                # For SAM, patch_size is usually 16, so seq_len = (H/16) * (W/16) = H*W/256
+                if expected_seq_len:
+                    # Try to find a square size that matches
+                    # seq_len = (size/16)^2, so size = sqrt(seq_len * 256)
+                    estimated_size = int((expected_seq_len * 256) ** 0.5)
+                    # Round to nearest multiple of 16
+                    estimated_size = (estimated_size // 16) * 16
+                    print(f"Estimated image size from seq_len: {estimated_size}x{estimated_size}")
+                    # But this might not be correct if the model expects non-square images
+                
+                # Use detected size if available, otherwise try original size
+                estimated_size = getattr(sam3_model, '_estimated_image_size', None)
+                if estimated_size:
+                    target_size = (estimated_size, estimated_size)
+                    print(f"Using detected image size: {target_size}")
+                    image_pil_resized = image_pil.resize(target_size, Image.Resampling.LANCZOS)
+                    image_np = np.array(image_pil_resized)
+                    h, w = estimated_size, estimated_size
                 else:
-                    # Use common SAM size: 1024x1024 (square)
-                    target_size = (1024, 1024)
-                    print(f"Using default target size: {target_size}")
-                
-                target_w, target_h = target_size
-                
-                # Resize image to target size (maintaining aspect ratio with padding if needed)
-                # Or use center crop + resize
-                # For now, let's try simple resize (may distort aspect ratio)
-                # Better approach: resize maintaining aspect ratio, then pad
-                image_pil_resized = image_pil.resize(target_size, Image.Resampling.LANCZOS)
-                image_np = np.array(image_pil_resized)
-                h, w = target_h, target_w
-                
-                print(f"Resized image from {original_size} to {target_size}")
+                    # Try original size
+                    print(f"Using original image size: {original_size} (no resizing)")
+                    image_pil_resized = image_pil
+                    image_np = np.array(image_pil_resized)
+                    h, w = original_h, original_w
                 
                 # Convert to tensor: [C, H, W] then add batch dimension: [1, C, H, W]
                 image_tensor = TF.to_tensor(image_pil_resized).unsqueeze(0).to(device)
                 print(f"Image tensor shape: {image_tensor.shape}, dtype: {image_tensor.dtype}")
                 
-                # Prepare point prompts - normalize coordinates to [0, 1]
-                # Points are provided in original image coordinates, need to scale to resized image
-                scale_x = w / original_w
-                scale_y = h / original_h
-                scaled_x = request.x * scale_x
-                scaled_y = request.y * scale_y
+                # Calculate actual sequence length for this image
+                patch_size = 16
+                actual_seq_len = (h // patch_size) * (w // patch_size)
+                detected_seq_len = getattr(sam3_model, '_detected_seq_len', None)
+                if detected_seq_len:
+                    print(f"Sequence length: actual={actual_seq_len}, expected={detected_seq_len}, match={actual_seq_len == detected_seq_len}")
                 
-                # Normalize to [0, 1]
-                point_coords_normalized = torch.tensor([[[scaled_x / w, scaled_y / h]]], dtype=torch.float32, device=device)
-                print(f"Point coordinates: original=({request.x}, {request.y}), scaled=({scaled_x:.2f}, {scaled_y:.2f}), normalized=({scaled_x/w:.4f}, {scaled_y/h:.4f})")
+                # Prepare point prompts - normalize coordinates to [0, 1]
+                # Since we're using original image size, no scaling needed
+                point_coords_normalized = torch.tensor([[[request.x / w, request.y / h]]], dtype=torch.float32, device=device)
+                print(f"Point coordinates: original=({request.x}, {request.y}), normalized=({request.x/w:.4f}, {request.y/h:.4f})")
                 point_labels_tensor = torch.tensor([[1]], dtype=torch.int64, device=device)
                 
                 # Create FindStage for point prompts
