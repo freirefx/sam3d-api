@@ -599,23 +599,39 @@ async def segment_image_sam3d(request: SegmentSam3dRequest):
                 inference_state = sam3_processor.set_image(image_pil)
                 print(f"✓ Image set, inference_state type: {type(inference_state)}")
                 
-                # Sam3Processor doesn't support point prompts directly
-                # add_geometric_prompt is for BOXES, not points
-                # set_text_prompt is for text prompts
-                # For point prompts, we need to use the direct model API (BatchedDatapoint)
-                import inspect
-                if hasattr(sam3_processor, 'add_geometric_prompt'):
-                    try:
-                        sig = inspect.signature(sam3_processor.add_geometric_prompt)
-                        print(f"add_geometric_prompt signature: {sig}")
-                        print(f"  Note: add_geometric_prompt is for BOXES, not points.")
-                    except:
-                        pass
+                # Sam3Processor doesn't support point prompts directly, but we can convert
+                # a point to a small box and use add_geometric_prompt
+                # This avoids the freqs_cis issues with direct model API
+                h, w = image_np.shape[:2]
+                box_size = min(w, h) * 0.02  # 2% of image size, minimum 10 pixels
+                box_size = max(box_size, 10)
                 
-                print(f"Sam3Processor doesn't support point prompts directly.")
-                print(f"  Available methods: {processor_methods}")
-                print(f"  Falling back to direct model API (BatchedDatapoint) for point prompts")
-                raise AttributeError("Sam3Processor doesn't support point prompts. Use direct model API.")
+                # Convert point to normalized cxcywh format (center_x, center_y, width, height)
+                center_x = request.x / w
+                center_y = request.y / h
+                box_width = box_size / w
+                box_height = box_size / h
+                
+                box_cxcywh = [center_x, center_y, box_width, box_height]
+                print(f"Converting point ({request.x}, {request.y}) to small box: {box_cxcywh}")
+                
+                # Use add_geometric_prompt with the box (label=True for positive)
+                inference_state = sam3_processor.add_geometric_prompt(
+                    box=box_cxcywh,
+                    label=True,  # Positive prompt
+                    state=inference_state
+                )
+                print(f"✓ Added geometric prompt (box from point)")
+                
+                # Extract masks from inference_state
+                if "masks" in inference_state:
+                    masks = inference_state["masks"]
+                    scores = inference_state.get("scores", None)
+                    print(f"✓ Got {len(masks)} masks from Sam3Processor")
+                else:
+                    print(f"⚠ No masks in inference_state")
+                    masks = None
+                    scores = None
                     
             except Exception as e:
                 import traceback
