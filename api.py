@@ -840,17 +840,31 @@ async def segment_image_sam3d(request: SegmentSam3dRequest):
                                                         module.rope_pt_size = (H_p, W_p)
                                                         print(f"    Set rope_pt_size to ({H_p}, {W_p})")
                                                     
-                                                    # Try calling without args (uses internal state/attributes)
+                                                    # Try calling with input_size parameter (if supported) or without args
                                                     try:
-                                                        module._setup_rope_freqs()
+                                                        old_shape = module.freqs_cis.shape if hasattr(module, 'freqs_cis') and module.freqs_cis is not None else None
+                                                        
+                                                        # Try calling with input_size first (patch dimensions)
+                                                        import inspect
+                                                        sig = inspect.signature(module._setup_rope_freqs)
+                                                        if len(sig.parameters) > 0 and 'input_size' in sig.parameters:
+                                                            # Method accepts input_size parameter
+                                                            module._setup_rope_freqs(input_size=(H_p, W_p))
+                                                            print(f"    Called _setup_rope_freqs with input_size=({H_p}, {W_p})")
+                                                        else:
+                                                            # Method doesn't accept parameters, uses rope_pt_size attribute
+                                                            module._setup_rope_freqs()
+                                                            print(f"    Called _setup_rope_freqs() (no params)")
+                                                        
                                                         # Ensure freqs_cis is on the same device as the model
                                                         if hasattr(module, 'freqs_cis') and module.freqs_cis is not None:
                                                             current_device = next(sam3_model.parameters()).device
+                                                            new_shape = module.freqs_cis.shape
                                                             if module.freqs_cis.device != current_device:
                                                                 module.freqs_cis = module.freqs_cis.to(device=current_device)
-                                                                print(f"    ✓ Moved freqs_cis from CPU to {current_device}")
+                                                                print(f"    ✓ Moved freqs_cis from CPU to {current_device}, shape: {old_shape} -> {new_shape}")
                                                             else:
-                                                                print(f"    ✓ freqs_cis already on {current_device}")
+                                                                print(f"    ✓ freqs_cis already on {current_device}, shape: {old_shape} -> {new_shape}")
                                                         print(f"    ✓ Called _setup_rope_freqs() successfully")
                                                     except Exception as e_call:
                                                         print(f"    _setup_rope_freqs() failed: {e_call}")
@@ -899,9 +913,13 @@ async def segment_image_sam3d(request: SegmentSam3dRequest):
                 except Exception as e:
                     print(f"Warning: Could not update freqs_cis: {e}")
                 
-                # Final verification: ensure all freqs_cis are on the correct device
+                # Final verification: ensure all freqs_cis are on the correct device and have correct shape
                 try:
                     current_device = next(sam3_model.parameters()).device
+                    patch_size = 16
+                    expected_seq_len = (h // patch_size) * (w // patch_size)
+                    print(f"Final verification: expected_seq_len={expected_seq_len} for image {h}x{w}")
+                    
                     if hasattr(sam3_model, 'backbone') and hasattr(sam3_model.backbone, 'vision_backbone'):
                         vision = sam3_model.backbone.vision_backbone
                         if hasattr(vision, 'trunk'):
@@ -910,6 +928,15 @@ async def segment_image_sam3d(request: SegmentSam3dRequest):
                                     if module.freqs_cis.device != current_device:
                                         module.freqs_cis = module.freqs_cis.to(device=current_device)
                                         print(f"Final fix: Moved {name}.freqs_cis to {current_device}")
+                                    
+                                    # Check shape
+                                    freqs_shape = module.freqs_cis.shape
+                                    if len(freqs_shape) >= 1:
+                                        freqs_seq_len = freqs_shape[0]
+                                        if freqs_seq_len != expected_seq_len:
+                                            print(f"Warning: {name}.freqs_cis has seq_len={freqs_seq_len}, expected {expected_seq_len}")
+                                        else:
+                                            print(f"✓ {name}.freqs_cis has correct seq_len={freqs_seq_len}")
                 except Exception as e:
                     print(f"Warning: Final freqs_cis device check failed: {e}")
                 
