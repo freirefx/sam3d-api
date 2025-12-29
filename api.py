@@ -2970,11 +2970,17 @@ async def video_propagate(request: VideoPropagateRequest):
                 
                 frames_processed += 1
 
+            # Store masks in session for later retrieval via get-frame
+            session["propagated_masks"] = masks_by_object
+            session["propagated_scores"] = scores_by_object
+            
+            # Return summary only - masks are too large to return all at once
+            # Use /video/get-frame/{session_id}/{frame_index} to get individual frames with masks
             return JSONResponse({
                 "success": True,
-                "masks": masks_by_object,
-                "scores": scores_by_object,
                 "num_frames_processed": frames_processed,
+                "objects_tracked": list(masks_by_object.keys()),
+                "message": "Propagation complete. Use /video/get-frame to retrieve frames with masks.",
             })
         else:
             return JSONResponse(
@@ -3058,11 +3064,27 @@ async def video_get_frame(session_id: str, frame_index: int):
         buffer.seek(0)
         frame_b64 = base64.b64encode(buffer.getvalue()).decode("utf-8")
 
+        # Get masks for this frame if propagation was done
+        frame_masks = {}
+        frame_scores = {}
+        propagated_masks = session.get("propagated_masks", {})
+        propagated_scores = session.get("propagated_scores", {})
+        
+        frame_idx_str = str(frame_index)
+        for obj_id, obj_masks in propagated_masks.items():
+            if frame_idx_str in obj_masks:
+                frame_masks[obj_id] = obj_masks[frame_idx_str]
+        for obj_id, obj_scores in propagated_scores.items():
+            if frame_idx_str in obj_scores:
+                frame_scores[obj_id] = obj_scores[frame_idx_str]
+
         return JSONResponse({
             "success": True,
             "frame": frame_b64,
             "frame_index": frame_index,
             "total_frames": total_frames,
+            "masks": frame_masks if frame_masks else None,
+            "scores": frame_scores if frame_scores else None,
         })
 
     except Exception as e:
