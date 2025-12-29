@@ -669,23 +669,23 @@ async def segment_image_sam3d(request: SegmentSam3dRequest):
                     scores = [scores[best_idx]] if len(scores) > best_idx else [0.95]
                 
                 for i in range(len(masks)):
-                mask = masks[i]
-                mask = (mask > request.mask_threshold).astype(np.uint8) * 255
+                    mask = masks[i]
+                    mask = (mask > request.mask_threshold).astype(np.uint8) * 255
 
-                kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-                mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
-                mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
-                mask = cv2.GaussianBlur(mask, (5, 5), 0)
-                mask = (mask > 127).astype(np.uint8) * 255
+                    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+                    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+                    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
+                    mask = cv2.GaussianBlur(mask, (5, 5), 0)
+                    mask = (mask > 127).astype(np.uint8) * 255
 
-                if request.invert_mask:
-                    mask = 255 - mask
+                    if request.invert_mask:
+                        mask = 255 - mask
 
-                mask_image = Image.fromarray(mask, mode="L")
-                buffer = io.BytesIO()
-                mask_image.save(buffer, format="PNG")
-                buffer.seek(0)
-                mask_base64 = base64.b64encode(buffer.getvalue()).decode("utf-8")
+                    mask_image = Image.fromarray(mask, mode="L")
+                    buffer = io.BytesIO()
+                    mask_image.save(buffer, format="PNG")
+                    buffer.seek(0)
+                    mask_base64 = base64.b64encode(buffer.getvalue()).decode("utf-8")
                     mask_list.append({
                         "mask": mask_base64,
                         "mask_shape": list(mask.shape),
