@@ -2928,12 +2928,6 @@ async def video_get_frame(session_id: str, frame_index: int):
         - masks: Dict of masks for each tracked object in this frame
     """
     try:
-        if not SAM3_VIDEO_AVAILABLE or sam3_video_predictor is None:
-            return JSONResponse(
-                status_code=503,
-                content={"error": "SAM 3 video predictor not available."},
-            )
-
         if session_id not in video_sessions:
             return JSONResponse(
                 status_code=404,
@@ -2941,38 +2935,59 @@ async def video_get_frame(session_id: str, frame_index: int):
             )
 
         session = video_sessions[session_id]
-        predictor_session_id = session.get("predictor_session_id", session_id)
-
-        # Call predictor to get frame
-        if hasattr(sam3_video_predictor, 'handle_request'):
-            response = sam3_video_predictor.handle_request({
-                "type": "get_frame",
-                "session_id": predictor_session_id,
-                "frame_index": frame_index,
-            })
-
-            # Encode frame to base64
-            frame_b64 = None
-            if "frame" in response and response["frame"] is not None:
-                frame_np = response["frame"]
-                if isinstance(frame_np, torch.Tensor):
-                    frame_np = frame_np.cpu().numpy()
-                frame_image = Image.fromarray(frame_np.astype(np.uint8), mode="RGB")
-                buffer = io.BytesIO()
-                frame_image.save(buffer, format="PNG")
-                buffer.seek(0)
-                frame_b64 = base64.b64encode(buffer.getvalue()).decode("utf-8")
-
-            return JSONResponse({
-                "success": True,
-                "frame": frame_b64,
-                "frame_index": frame_index,
-            })
-        else:
+        video_path = session.get("video_path")
+        
+        if not video_path or not os.path.exists(video_path):
             return JSONResponse(
-                status_code=501,
-                content={"error": "Video predictor does not support get_frame."},
+                status_code=404,
+                content={"error": "Video file not found for this session."},
             )
+
+        # Read frame directly from video using OpenCV
+        cap = cv2.VideoCapture(video_path)
+        
+        if not cap.isOpened():
+            return JSONResponse(
+                status_code=500,
+                content={"error": "Could not open video file."},
+            )
+        
+        # Get total frames
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        if frame_index < 0 or frame_index >= total_frames:
+            cap.release()
+            return JSONResponse(
+                status_code=400,
+                content={"error": f"Frame index {frame_index} out of range (0-{total_frames-1})."},
+            )
+        
+        # Seek to frame
+        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
+        ret, frame_bgr = cap.read()
+        cap.release()
+        
+        if not ret or frame_bgr is None:
+            return JSONResponse(
+                status_code=500,
+                content={"error": f"Could not read frame {frame_index}."},
+            )
+        
+        # Convert BGR to RGB
+        frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+        
+        # Encode frame to base64
+        frame_image = Image.fromarray(frame_rgb.astype(np.uint8), mode="RGB")
+        buffer = io.BytesIO()
+        frame_image.save(buffer, format="PNG")
+        buffer.seek(0)
+        frame_b64 = base64.b64encode(buffer.getvalue()).decode("utf-8")
+
+        return JSONResponse({
+            "success": True,
+            "frame": frame_b64,
+            "frame_index": frame_index,
+            "total_frames": total_frames,
+        })
 
     except Exception as e:
         import traceback
