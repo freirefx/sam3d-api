@@ -2767,9 +2767,8 @@ async def video_add_prompt(request: VideoAddPromptRequest):
 
         # Build prompt request - SAM3 video predictor uses specific parameter names:
         # - "obj_id" not "object_id"
-        # - "points" not "point_coords" (as torch tensor)
+        # - "points" not "point_coords" (as torch tensor with RELATIVE coords 0-1)
         # - "text" for text prompts
-        # - "boxes" for box prompts (as torch tensor)
         prompt_request = {
             "type": "add_prompt",
             "session_id": predictor_session_id,
@@ -2780,58 +2779,47 @@ async def video_add_prompt(request: VideoAddPromptRequest):
         # Add prompt data
         print(f"[DEBUG] add_prompt raw request: text={request.text}, point_coords={request.point_coords}, box={request.box}")
         
-        # Get frame dimensions from session for box creation
-        width = session.get("width", 1920)
-        height = session.get("height", 1080)
+        # Get frame dimensions from session for coordinate normalization
+        width = session.get("video_width", session.get("width", 1920))
+        height = session.get("video_height", session.get("height", 1080))
+        print(f"[DEBUG] Frame dimensions: {width}x{height}")
         
         has_prompt = False
         
+        # TEXT PROMPT - preferred for initial detection
         if request.text:
             prompt_request["text"] = request.text
             has_prompt = True
             print(f"[DEBUG] Using text prompt: {request.text}")
         
-        if request.box and len(request.box) == 4:
-            # Convert to torch tensor - SAM3 expects tensor
-            boxes_tensor = torch.tensor([request.box], dtype=torch.float32, device=device)
-            prompt_request["boxes"] = boxes_tensor
-            has_prompt = True
-            print(f"[DEBUG] Using provided box as tensor: {request.box}")
-        
+        # POINT PROMPT - convert to relative coordinates (0-1)
         if request.point_coords and len(request.point_coords) > 0:
-            # Convert points to torch tensors - SAM3 uses "points" not "point_coords"
-            points_tensor = torch.tensor(request.point_coords, dtype=torch.float32, device=device)
+            # Convert absolute coords to relative (0-1 range) as SAM3 expects
+            rel_points = [[x / width, y / height] for x, y in request.point_coords]
+            points_tensor = torch.tensor(rel_points, dtype=torch.float32, device=device)
             labels_list = request.point_labels or [1] * len(request.point_coords)
             labels_tensor = torch.tensor(labels_list, dtype=torch.int32, device=device)
             
             prompt_request["points"] = points_tensor
             prompt_request["point_labels"] = labels_tensor
             has_prompt = True
-            print(f"[DEBUG] Using points tensor: {points_tensor.shape}")
-            
-            # SAM3 video also needs boxes when using points, create from points
-            if "boxes" not in prompt_request and not request.text:
-                points = request.point_coords
-                xs = [p[0] for p in points]
-                ys = [p[1] for p in points]
-                padding = 100
-                box = [
-                    max(0, min(xs) - padding), 
-                    max(0, min(ys) - padding), 
-                    min(width, max(xs) + padding), 
-                    min(height, max(ys) + padding)
-                ]
-                boxes_tensor = torch.tensor([box], dtype=torch.float32, device=device)
-                prompt_request["boxes"] = boxes_tensor
-                print(f"[DEBUG] Created box tensor from points: {box}")
+            print(f"[DEBUG] Using relative points: {rel_points}")
         
-        # FALLBACK: If still no prompt, create a default box from frame center
-        if not has_prompt:
-            cx, cy = width // 2, height // 2
-            default_box = [cx - 200, cy - 200, cx + 200, cy + 200]
-            boxes_tensor = torch.tensor([default_box], dtype=torch.float32, device=device)
+        # BOX PROMPT - convert to relative coordinates
+        if request.box and len(request.box) == 4:
+            # Convert absolute box [x1, y1, x2, y2] to relative (0-1)
+            x1, y1, x2, y2 = request.box
+            rel_box = [x1 / width, y1 / height, x2 / width, y2 / height]
+            boxes_tensor = torch.tensor([rel_box], dtype=torch.float32, device=device)
             prompt_request["boxes"] = boxes_tensor
-            print(f"[DEBUG] Using default center box tensor as fallback: {default_box}")
+            has_prompt = True
+            print(f"[DEBUG] Using relative box: {rel_box}")
+        
+        # FALLBACK: If no specific prompt, use text as fallback
+        if not has_prompt:
+            # Default to "object" text for initial detection
+            prompt_request["text"] = "object"
+            print(f"[DEBUG] Using fallback text prompt: 'object'")
         
         print(f"[DEBUG] Final prompt_request keys: {list(prompt_request.keys())}")
         
@@ -2848,7 +2836,24 @@ async def video_add_prompt(request: VideoAddPromptRequest):
 
         # Call predictor
         if hasattr(sam3_video_predictor, 'handle_request'):
-            response = sam3_video_predictor.handle_request(prompt_request)
+            try:
+                response = sam3_video_predictor.handle_request(prompt_request)
+            except AssertionError as ae:
+                # Handle "No cached outputs found" error by falling back to text prompt
+                if "cached outputs" in str(ae).lower() or "propagation" in str(ae).lower():
+                    print(f"[DEBUG] Cache error, falling back to text prompt: {ae}")
+                    # Remove points/boxes and use text instead
+                    text_prompt_request = {
+                        "type": "add_prompt",
+                        "session_id": predictor_session_id,
+                        "frame_index": request.frame_index,
+                        "obj_id": request.object_id,
+                        "text": request.text or "object",  # Use provided text or default
+                    }
+                    print(f"[DEBUG] Retrying with text prompt: {text_prompt_request}")
+                    response = sam3_video_predictor.handle_request(text_prompt_request)
+                else:
+                    raise
 
             # Track object in session
             session["objects"][request.object_id] = {
