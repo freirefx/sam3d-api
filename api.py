@@ -465,22 +465,31 @@ def initialize_sam3_video_predictor():
             return model
         
         def register_float32_hooks(model):
-            """Register hooks to convert inputs/outputs to float32"""
+            """Register hooks to convert inputs/outputs to float32 (only bfloat16/float16, preserve int/long)"""
+            def convert_tensor(tensor):
+                """Convert only bfloat16/float16 to float32, preserve all other dtypes (int, long, bool, float32)"""
+                if not isinstance(tensor, torch.Tensor):
+                    return tensor
+                # Only convert bfloat16 and float16 to float32
+                # Preserve int, long, bool, float32, etc.
+                if tensor.dtype in (torch.bfloat16, torch.float16):
+                    return tensor.to(dtype=torch.float32)
+                return tensor
+            
             def convert_input_hook(module, input):
                 if isinstance(input, tuple):
-                    return tuple(x.to(dtype=torch.float32) if isinstance(x, torch.Tensor) and x.dtype != torch.float32 else x for x in input)
+                    return tuple(convert_tensor(x) for x in input)
                 elif isinstance(input, torch.Tensor):
-                    return input.to(dtype=torch.float32) if input.dtype != torch.float32 else input
+                    return convert_tensor(input)
                 return input
             
             def convert_output_hook(module, input, output):
                 if isinstance(output, torch.Tensor):
-                    return output.to(dtype=torch.float32) if output.dtype != torch.float32 else output
+                    return convert_tensor(output)
                 elif isinstance(output, dict):
-                    return {k: v.to(dtype=torch.float32) if isinstance(v, torch.Tensor) and v.dtype != torch.float32 else v 
-                           for k, v in output.items()}
+                    return {k: convert_tensor(v) for k, v in output.items()}
                 elif isinstance(output, tuple):
-                    return tuple(x.to(dtype=torch.float32) if isinstance(x, torch.Tensor) and x.dtype != torch.float32 else x for x in output)
+                    return tuple(convert_tensor(x) for x in output)
                 return output
             
             # Register hooks on critical modules (decoder, backbone, etc.)
