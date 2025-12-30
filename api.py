@@ -3077,13 +3077,25 @@ async def video_add_prompt(request: VideoAddPromptRequest):
                             debug_info["mask_source"] = f"outputs['out_binary_masks'][{obj_idx}]"
                             debug_info["object_id_found"] = True
                             debug_info["object_id_index"] = int(obj_idx)
+                            debug_info["actual_object_id"] = int(obj_ids[obj_idx])
                         else:
-                            # If object_id not found, use first mask (may be the only one)
+                            # If object_id not found, use first mask (SAM3 assigns its own IDs)
+                            # This is normal - SAM3 assigns sequential IDs starting from 0
                             if len(masks_array) > 0:
                                 mask_np = masks_array[0]
-                                debug_info["mask_source"] = f"outputs['out_binary_masks'][0] (object_id {request.object_id} not in out_obj_ids, using first mask)"
+                                actual_id = int(obj_ids[0]) if len(obj_ids) > 0 else 0
+                                debug_info["mask_source"] = f"outputs['out_binary_masks'][0]"
                                 debug_info["object_id_found"] = False
-                                debug_info["available_obj_ids"] = obj_ids
+                                debug_info["requested_object_id"] = request.object_id
+                                debug_info["actual_object_id"] = actual_id
+                                debug_info["available_obj_ids"] = [int(oid) for oid in obj_ids]
+                                debug_info["note"] = f"SAM3 assigned object ID {actual_id} (you requested {request.object_id}). This is normal - SAM3 assigns its own sequential IDs."
+                                
+                                # Update session to track the actual ID assigned by SAM3
+                                if request.object_id not in session.get("objects", {}):
+                                    session.setdefault("objects", {})[request.object_id] = {}
+                                session["objects"][request.object_id]["actual_sam3_id"] = actual_id
+                                session["objects"][request.object_id]["sam3_id_mapping"] = {request.object_id: actual_id}
                     except Exception as e:
                         print(f"[DEBUG] Error finding mask for object_id {request.object_id}: {e}")
                         debug_info["object_id_error"] = str(e)
