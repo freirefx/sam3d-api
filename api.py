@@ -429,24 +429,45 @@ def initialize_sam3_video_predictor():
         elif 'checkpoint_path' in param_names and checkpoint_path:
             kwargs['checkpoint_path'] = checkpoint_path
 
+        # Force float32 dtype before building to avoid BFloat16 issues
+        original_dtype = torch.get_default_dtype()
+        torch.set_default_dtype(torch.float32)
+        
         print(f"  Calling build_sam3_video_predictor with: {kwargs}")
         sam3_video_predictor = build_sam3_video_predictor(**kwargs)
+        
+        # Restore original dtype
+        torch.set_default_dtype(original_dtype)
 
         # Fix dtype mismatch: convert ENTIRE model to float32 
         # This prevents "Input type (c10::BFloat16) and bias type (float)" errors
         print("  Converting video predictor to float32 to avoid BFloat16 errors...")
         
+        def convert_to_float32(module):
+            """Recursively convert all parameters and buffers to float32"""
+            for name, param in module.named_parameters(recurse=False):
+                if param is not None:
+                    param.data = param.data.float()
+            for name, buffer in module.named_buffers(recurse=False):
+                if buffer is not None and buffer.dtype in (torch.bfloat16, torch.float16):
+                    buffer.data = buffer.data.float()
+        
         # Convert the entire predictor and all its submodules
         if hasattr(sam3_video_predictor, 'model'):
+            # Convert all parameters and buffers recursively
+            sam3_video_predictor.model.apply(convert_to_float32)
+            # Also call .float() on the model itself
             sam3_video_predictor.model = sam3_video_predictor.model.float()
-            print("  Converted entire model to float32")
+            print("  Converted entire model to float32 (parameters + buffers)")
             
-            # Also explicitly convert any submodules that might retain bfloat16
-            for name, module in sam3_video_predictor.model.named_modules():
-                if hasattr(module, 'weight') and module.weight is not None:
-                    if module.weight.dtype == torch.bfloat16:
-                        module.float()
-            print("  Verified all submodules are float32")
+            # Verify conversion
+            bfloat16_found = False
+            for name, param in sam3_video_predictor.model.named_parameters():
+                if param.dtype == torch.bfloat16:
+                    print(f"  WARNING: Parameter {name} still in bfloat16!")
+                    bfloat16_found = True
+            if not bfloat16_found:
+                print("  Verified: All parameters are float32")
 
         SAM3_VIDEO_AVAILABLE = True
         print("✓ SAM 3 video predictor initialized successfully")
@@ -2951,80 +2972,83 @@ def run_propagation_sync(task_id: str, session_id: str, predictor_session_id: st
         # Skip metadata keys that are not object masks
         metadata_keys = {"out_obj_ids", "out_probs", "out_boxes_xywh", "obj_ids", "probs", "boxes"}
         
-        for response in sam3_video_predictor.handle_stream_request(request=propagate_request):
-            frame_idx = response.get("frame_index", response.get("frame_idx", frames_processed))
-            outputs = response.get("outputs", {})
-            
-            for obj_id, obj_output in outputs.items():
-                if obj_id in metadata_keys:
-                    continue
+        # Disable autocast to prevent automatic bfloat16 conversion
+        # Force float32 throughout propagation
+        with torch.cuda.amp.autocast(enabled=False):
+            for response in sam3_video_predictor.handle_stream_request(request=propagate_request):
+                frame_idx = response.get("frame_index", response.get("frame_idx", frames_processed))
+                outputs = response.get("outputs", {})
                 
-                try:
-                    obj_id_int = int(obj_id)
-                except (ValueError, TypeError):
-                    continue
-                
-                obj_id_str = str(obj_id_int)
-                if obj_id_str not in masks_by_object:
-                    masks_by_object[obj_id_str] = {}
-                    scores_by_object[obj_id_str] = {}
-                
-                mask = None
-                score = 1.0
-                
-                if isinstance(obj_output, dict):
-                    mask = obj_output.get("mask", obj_output.get("video_res_mask"))
-                    score = obj_output.get("score", obj_output.get("obj_score", 1.0))
-                elif isinstance(obj_output, np.ndarray):
-                    if obj_output.size == 0 or obj_output.ndim < 2:
+                for obj_id, obj_output in outputs.items():
+                    if obj_id in metadata_keys:
                         continue
-                    mask = obj_output
-                elif isinstance(obj_output, torch.Tensor):
-                    if obj_output.numel() == 0:
-                        continue
-                    mask = obj_output.cpu().numpy()
-                else:
-                    continue
-                
-                if mask is not None and mask.size > 0:
-                    if isinstance(mask, torch.Tensor):
-                        mask = mask.cpu().numpy()
-                    
-                    if mask.size == 0 or mask.ndim < 2:
-                        continue
-                    
-                    while mask.ndim > 2:
-                        if mask.shape[0] == 1:
-                            mask = mask[0]
-                        elif mask.shape[-1] == 1:
-                            mask = mask[..., 0]
-                        elif mask.shape[0] > 1:
-                            mask = mask[0]
-                        else:
-                            break
-                    
-                    if mask.ndim != 2:
-                        continue
-                    
-                    mask = (mask > 0).astype(np.uint8) * 255
                     
                     try:
-                        mask_image = Image.fromarray(mask, mode="L")
-                        buffer = io.BytesIO()
-                        mask_image.save(buffer, format="PNG")
-                        buffer.seek(0)
-                        masks_by_object[obj_id_str][str(frame_idx)] = base64.b64encode(buffer.getvalue()).decode("utf-8")
-                    except Exception:
+                        obj_id_int = int(obj_id)
+                    except (ValueError, TypeError):
                         continue
+                    
+                    obj_id_str = str(obj_id_int)
+                    if obj_id_str not in masks_by_object:
+                        masks_by_object[obj_id_str] = {}
+                        scores_by_object[obj_id_str] = {}
+                    
+                    mask = None
+                    score = 1.0
+                    
+                    if isinstance(obj_output, dict):
+                        mask = obj_output.get("mask", obj_output.get("video_res_mask"))
+                        score = obj_output.get("score", obj_output.get("obj_score", 1.0))
+                    elif isinstance(obj_output, np.ndarray):
+                        if obj_output.size == 0 or obj_output.ndim < 2:
+                            continue
+                        mask = obj_output
+                    elif isinstance(obj_output, torch.Tensor):
+                        if obj_output.numel() == 0:
+                            continue
+                        mask = obj_output.cpu().numpy()
+                    else:
+                        continue
+                    
+                    if mask is not None and mask.size > 0:
+                        if isinstance(mask, torch.Tensor):
+                            mask = mask.cpu().numpy()
+                        
+                        if mask.size == 0 or mask.ndim < 2:
+                            continue
+                        
+                        while mask.ndim > 2:
+                            if mask.shape[0] == 1:
+                                mask = mask[0]
+                            elif mask.shape[-1] == 1:
+                                mask = mask[..., 0]
+                            elif mask.shape[0] > 1:
+                                mask = mask[0]
+                            else:
+                                break
+                        
+                        if mask.ndim != 2:
+                            continue
+                        
+                        mask = (mask > 0).astype(np.uint8) * 255
+                        
+                        try:
+                            mask_image = Image.fromarray(mask, mode="L")
+                            buffer = io.BytesIO()
+                            mask_image.save(buffer, format="PNG")
+                            buffer.seek(0)
+                            masks_by_object[obj_id_str][str(frame_idx)] = base64.b64encode(buffer.getvalue()).decode("utf-8")
+                        except Exception:
+                            continue
+                    
+                    if isinstance(score, torch.Tensor):
+                        score = score.item()
+                    scores_by_object[obj_id_str][str(frame_idx)] = float(score)
                 
-                if isinstance(score, torch.Tensor):
-                    score = score.item()
-                scores_by_object[obj_id_str][str(frame_idx)] = float(score)
-            
-            frames_processed += 1
-            if total_frames > 0:
-                propagation_tasks[task_id]["progress"] = frames_processed / total_frames
-                propagation_tasks[task_id]["frames_processed"] = frames_processed
+                frames_processed += 1
+                if total_frames > 0:
+                    propagation_tasks[task_id]["progress"] = frames_processed / total_frames
+                    propagation_tasks[task_id]["frames_processed"] = frames_processed
 
         # Store masks in session
         session["propagated_masks"] = masks_by_object
