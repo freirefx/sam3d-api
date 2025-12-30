@@ -3044,14 +3044,52 @@ async def video_add_prompt(request: VideoAddPromptRequest):
                     if isinstance(value, dict):
                         print(f"[DEBUG]     dict keys: {list(value.keys())}")
             
-            # Check for masks - SAM3 video returns masks in outputs[object_id]
+            # Check for masks - SAM3 video returns masks in outputs['out_binary_masks']
+            # with object IDs in outputs['out_obj_ids']
             mask_np = None
             
             # First try response["mask"]
             if "mask" in response and response["mask"] is not None:
                 mask_np = response["mask"]
                 debug_info["mask_source"] = "response['mask']"
-            # Then try outputs[object_id] - this is where SAM3 video typically stores masks
+            # SAM3 video format: outputs['out_binary_masks'] contains all masks, 
+            # outputs['out_obj_ids'] contains corresponding object IDs
+            elif isinstance(outputs, dict) and "out_binary_masks" in outputs:
+                masks_array = outputs["out_binary_masks"]  # Shape: (N, H, W)
+                obj_ids = outputs.get("out_obj_ids", [])  # Shape: (N,)
+                
+                # Find mask for this object_id
+                if len(obj_ids) > 0 and len(masks_array) > 0:
+                    # Convert obj_ids to list if numpy array
+                    if isinstance(obj_ids, np.ndarray):
+                        obj_ids = obj_ids.tolist()
+                    
+                    # Find index of our object_id
+                    try:
+                        obj_idx = None
+                        for i, oid in enumerate(obj_ids):
+                            if int(oid) == request.object_id:
+                                obj_idx = i
+                                break
+                        
+                        if obj_idx is not None and obj_idx < len(masks_array):
+                            mask_np = masks_array[obj_idx]
+                            debug_info["mask_source"] = f"outputs['out_binary_masks'][{obj_idx}]"
+                            debug_info["object_id_found"] = True
+                            debug_info["object_id_index"] = int(obj_idx)
+                        else:
+                            # If object_id not found, use first mask (may be the only one)
+                            if len(masks_array) > 0:
+                                mask_np = masks_array[0]
+                                debug_info["mask_source"] = f"outputs['out_binary_masks'][0] (object_id {request.object_id} not in out_obj_ids, using first mask)"
+                                debug_info["object_id_found"] = False
+                                debug_info["available_obj_ids"] = obj_ids
+                    except Exception as e:
+                        print(f"[DEBUG] Error finding mask for object_id {request.object_id}: {e}")
+                        debug_info["object_id_error"] = str(e)
+                else:
+                    debug_info["mask_source"] = "out_binary_masks empty or out_obj_ids empty"
+            # Fallback: try outputs[object_id] format
             elif isinstance(outputs, dict):
                 obj_id_str = str(request.object_id)
                 # Try object_id as key
@@ -3070,23 +3108,6 @@ async def video_add_prompt(request: VideoAddPromptRequest):
                     elif isinstance(obj_output, (torch.Tensor, np.ndarray)):
                         mask_np = obj_output
                     debug_info["mask_source"] = f"outputs[{request.object_id}]"
-                # Check all outputs for masks
-                else:
-                    for key, value in outputs.items():
-                        if key == request.object_id or str(key) == str(request.object_id):
-                            if isinstance(value, dict):
-                                mask_np = value.get("mask", value.get("video_res_mask"))
-                            elif isinstance(value, (torch.Tensor, np.ndarray)):
-                                mask_np = value
-                            debug_info["mask_source"] = f"outputs[{key}]"
-                            break
-                        # Also check if value itself is a mask
-                        if isinstance(value, (torch.Tensor, np.ndarray)) and len(value.shape) >= 2:
-                            # Could be a mask, check if it's 2D or 3D with single channel
-                            if value.ndim == 2 or (value.ndim == 3 and value.shape[0] == 1):
-                                mask_np = value
-                                debug_info["mask_source"] = f"outputs[{key}] (auto-detected)"
-                                break
             
             # Process mask if found
             if mask_np is not None:
@@ -3137,9 +3158,19 @@ async def video_add_prompt(request: VideoAddPromptRequest):
             
             # Check outputs for object info
             if isinstance(outputs, dict):
-                num_objects = len([k for k in outputs.keys() if isinstance(k, (int, str)) and str(k).isdigit()])
-                debug_info["num_objects_detected"] = num_objects
-                debug_info["object_ids"] = [k for k in outputs.keys() if isinstance(k, (int, str)) and (str(k).isdigit() or k == request.object_id)]
+                # SAM3 video format: use out_obj_ids
+                if "out_obj_ids" in outputs:
+                    obj_ids = outputs["out_obj_ids"]
+                    if isinstance(obj_ids, np.ndarray):
+                        obj_ids = obj_ids.tolist()
+                    debug_info["num_objects_detected"] = len(obj_ids)
+                    debug_info["object_ids"] = [int(oid) for oid in obj_ids]
+                    debug_info["object_probs"] = outputs.get("out_probs", []).tolist() if "out_probs" in outputs else []
+                else:
+                    # Fallback: count numeric keys
+                    num_objects = len([k for k in outputs.keys() if isinstance(k, (int, str)) and str(k).isdigit()])
+                    debug_info["num_objects_detected"] = num_objects
+                    debug_info["object_ids"] = [k for k in outputs.keys() if isinstance(k, (int, str)) and (str(k).isdigit() or k == request.object_id)]
             
             print(f"[DEBUG] add_prompt result - mask_area: {debug_info.get('mask_area_pixels', 0)} pixels ({debug_info.get('mask_area_percent', 0):.2f}%), num_objects: {debug_info.get('num_objects_detected', 0)}")
 
