@@ -3279,71 +3279,136 @@ def run_propagation_sync(task_id: str, session_id: str, predictor_session_id: st
                 frame_idx = response.get("frame_index", response.get("frame_idx", frames_processed))
                 outputs = response.get("outputs", {})
                 
-                for obj_id, obj_output in outputs.items():
-                    if obj_id in metadata_keys:
-                        continue
+                # Debug first few frames
+                if frames_processed < 3:
+                    print(f"[DEBUG] Propagation frame {frame_idx} - outputs keys: {list(outputs.keys()) if isinstance(outputs, dict) else 'not dict'}")
+                    if isinstance(outputs, dict) and "out_binary_masks" in outputs:
+                        print(f"[DEBUG]   out_binary_masks shape: {outputs['out_binary_masks'].shape}, out_obj_ids: {outputs.get('out_obj_ids', 'N/A')}")
+                
+                # SAM3 video format: masks in out_binary_masks, IDs in out_obj_ids
+                if isinstance(outputs, dict) and "out_binary_masks" in outputs:
+                    masks_array = outputs["out_binary_masks"]  # Shape: (N, H, W)
+                    obj_ids = outputs.get("out_obj_ids", [])
+                    probs = outputs.get("out_probs", [])
                     
-                    try:
+                    # Convert to lists if numpy arrays
+                    if isinstance(obj_ids, np.ndarray):
+                        obj_ids = obj_ids.tolist()
+                    if isinstance(probs, np.ndarray):
+                        probs = probs.tolist()
+                    
+                    # Process each mask
+                    for i, (obj_id, mask_np) in enumerate(zip(obj_ids, masks_array)):
                         obj_id_int = int(obj_id)
-                    except (ValueError, TypeError):
-                        continue
-                    
-                    obj_id_str = str(obj_id_int)
-                    if obj_id_str not in masks_by_object:
-                        masks_by_object[obj_id_str] = {}
-                        scores_by_object[obj_id_str] = {}
-                    
-                    mask = None
-                    score = 1.0
-                    
-                    if isinstance(obj_output, dict):
-                        mask = obj_output.get("mask", obj_output.get("video_res_mask"))
-                        score = obj_output.get("score", obj_output.get("obj_score", 1.0))
-                    elif isinstance(obj_output, np.ndarray):
-                        if obj_output.size == 0 or obj_output.ndim < 2:
-                            continue
-                        mask = obj_output
-                    elif isinstance(obj_output, torch.Tensor):
-                        if obj_output.numel() == 0:
-                            continue
-                        mask = obj_output.cpu().numpy()
-                    else:
-                        continue
-                    
-                    if mask is not None and mask.size > 0:
-                        if isinstance(mask, torch.Tensor):
-                            mask = mask.cpu().numpy()
+                        obj_id_str = str(obj_id_int)
                         
-                        if mask.size == 0 or mask.ndim < 2:
+                        if obj_id_str not in masks_by_object:
+                            masks_by_object[obj_id_str] = {}
+                            scores_by_object[obj_id_str] = {}
+                        
+                        # Get score for this object
+                        score = probs[i] if i < len(probs) else 1.0
+                        
+                        # Process mask
+                        if mask_np is not None and mask_np.size > 0:
+                            if isinstance(mask_np, torch.Tensor):
+                                mask_np = mask_np.cpu().numpy()
+                            
+                            # Ensure 2D
+                            while mask_np.ndim > 2:
+                                if mask_np.shape[0] == 1:
+                                    mask_np = mask_np[0]
+                                elif mask_np.shape[-1] == 1:
+                                    mask_np = mask_np[..., 0]
+                                else:
+                                    mask_np = mask_np[0]
+                                    break
+                            
+                            if mask_np.ndim != 2:
+                                continue
+                            
+                            mask_np = (mask_np > 0).astype(np.uint8) * 255
+                            
+                            try:
+                                mask_image = Image.fromarray(mask_np, mode="L")
+                                buffer = io.BytesIO()
+                                mask_image.save(buffer, format="PNG")
+                                buffer.seek(0)
+                                masks_by_object[obj_id_str][str(frame_idx)] = base64.b64encode(buffer.getvalue()).decode("utf-8")
+                                
+                                if isinstance(score, torch.Tensor):
+                                    score = score.item()
+                                scores_by_object[obj_id_str][str(frame_idx)] = float(score)
+                            except Exception as e:
+                                print(f"[DEBUG] Error encoding mask for obj {obj_id_str}, frame {frame_idx}: {e}")
+                                continue
+                else:
+                    # Fallback: old format with obj_id as keys
+                    for obj_id, obj_output in outputs.items():
+                        if obj_id in metadata_keys:
                             continue
-                        
-                        while mask.ndim > 2:
-                            if mask.shape[0] == 1:
-                                mask = mask[0]
-                            elif mask.shape[-1] == 1:
-                                mask = mask[..., 0]
-                            elif mask.shape[0] > 1:
-                                mask = mask[0]
-                            else:
-                                break
-                        
-                        if mask.ndim != 2:
-                            continue
-                        
-                        mask = (mask > 0).astype(np.uint8) * 255
                         
                         try:
-                            mask_image = Image.fromarray(mask, mode="L")
-                            buffer = io.BytesIO()
-                            mask_image.save(buffer, format="PNG")
-                            buffer.seek(0)
-                            masks_by_object[obj_id_str][str(frame_idx)] = base64.b64encode(buffer.getvalue()).decode("utf-8")
-                        except Exception:
+                            obj_id_int = int(obj_id)
+                        except (ValueError, TypeError):
                             continue
-                    
-                    if isinstance(score, torch.Tensor):
-                        score = score.item()
-                    scores_by_object[obj_id_str][str(frame_idx)] = float(score)
+                        
+                        obj_id_str = str(obj_id_int)
+                        if obj_id_str not in masks_by_object:
+                            masks_by_object[obj_id_str] = {}
+                            scores_by_object[obj_id_str] = {}
+                        
+                        mask = None
+                        score = 1.0
+                        
+                        if isinstance(obj_output, dict):
+                            mask = obj_output.get("mask", obj_output.get("video_res_mask"))
+                            score = obj_output.get("score", obj_output.get("obj_score", 1.0))
+                        elif isinstance(obj_output, np.ndarray):
+                            if obj_output.size == 0 or obj_output.ndim < 2:
+                                continue
+                            mask = obj_output
+                        elif isinstance(obj_output, torch.Tensor):
+                            if obj_output.numel() == 0:
+                                continue
+                            mask = obj_output.cpu().numpy()
+                        else:
+                            continue
+                        
+                        if mask is not None and mask.size > 0:
+                            if isinstance(mask, torch.Tensor):
+                                mask = mask.cpu().numpy()
+                            
+                            if mask.size == 0 or mask.ndim < 2:
+                                continue
+                            
+                            while mask.ndim > 2:
+                                if mask.shape[0] == 1:
+                                    mask = mask[0]
+                                elif mask.shape[-1] == 1:
+                                    mask = mask[..., 0]
+                                elif mask.shape[0] > 1:
+                                    mask = mask[0]
+                                else:
+                                    break
+                            
+                            if mask.ndim != 2:
+                                continue
+                            
+                            mask = (mask > 0).astype(np.uint8) * 255
+                            
+                            try:
+                                mask_image = Image.fromarray(mask, mode="L")
+                                buffer = io.BytesIO()
+                                mask_image.save(buffer, format="PNG")
+                                buffer.seek(0)
+                                masks_by_object[obj_id_str][str(frame_idx)] = base64.b64encode(buffer.getvalue()).decode("utf-8")
+                            except Exception:
+                                continue
+                        
+                        if isinstance(score, torch.Tensor):
+                            score = score.item()
+                        scores_by_object[obj_id_str][str(frame_idx)] = float(score)
                 
                 frames_processed += 1
                 if total_frames > 0:
@@ -3353,6 +3418,11 @@ def run_propagation_sync(task_id: str, session_id: str, predictor_session_id: st
         # Store masks in session
         session["propagated_masks"] = masks_by_object
         session["propagated_scores"] = scores_by_object
+        
+        # Log summary
+        print(f"[DEBUG] Propagation complete - stored masks for {len(masks_by_object)} objects: {list(masks_by_object.keys())}")
+        for obj_id, frames_dict in masks_by_object.items():
+            print(f"[DEBUG]   Object {obj_id}: {len(frames_dict)} frames with masks")
         
         propagation_tasks[task_id]["status"] = "completed"
         propagation_tasks[task_id]["progress"] = 1.0
@@ -3554,12 +3624,35 @@ async def video_get_frame(session_id: str, frame_index: int):
         propagated_scores = session.get("propagated_scores", {})
         
         frame_idx_str = str(frame_index)
+        
+        # Also check for ID mapping - user may have requested object_id 1 but SAM3 assigned 0
+        objects = session.get("objects", {})
+        id_mapping = {}
+        for user_obj_id, obj_data in objects.items():
+            if "actual_sam3_id" in obj_data:
+                sam3_id = obj_data["actual_sam3_id"]
+                id_mapping[str(user_obj_id)] = str(sam3_id)
+                id_mapping[str(sam3_id)] = str(user_obj_id)  # Reverse mapping
+        
         for obj_id, obj_masks in propagated_masks.items():
             if frame_idx_str in obj_masks:
+                # Use both the SAM3 ID and mapped user ID
                 frame_masks[obj_id] = obj_masks[frame_idx_str]
+                # Also add with user's requested ID if mapped
+                if obj_id in id_mapping:
+                    mapped_id = id_mapping[obj_id]
+                    frame_masks[mapped_id] = obj_masks[frame_idx_str]
+        
         for obj_id, obj_scores in propagated_scores.items():
             if frame_idx_str in obj_scores:
                 frame_scores[obj_id] = obj_scores[frame_idx_str]
+                # Also add with user's requested ID if mapped
+                if obj_id in id_mapping:
+                    mapped_id = id_mapping[obj_id]
+                    frame_scores[mapped_id] = obj_scores[frame_idx_str]
+        
+        if not frame_masks:
+            print(f"[DEBUG] No masks found for frame {frame_index}. Available object IDs: {list(propagated_masks.keys())}, frame keys in first object: {list(list(propagated_masks.values())[0].keys())[:5] if propagated_masks else 'N/A'}")
 
         return JSONResponse({
             "success": True,
