@@ -96,8 +96,12 @@ else:
 
 print(f"Using device: {device}")
 
+# DISABLED: Global autocast with bfloat16 causes dtype mismatch errors in SAM3 video
+# The video model needs float32 to avoid "Input type (c10::BFloat16) and bias type (float)" errors
+# if device.type == "cuda":
+#     torch.autocast("cuda", dtype=torch.bfloat16).__enter__()
+
 if device.type == "cuda":
-    torch.autocast("cuda", dtype=torch.bfloat16).__enter__()
     if torch.cuda.get_device_properties(0).major >= 8:
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
@@ -468,6 +472,16 @@ def initialize_sam3_video_predictor():
                     bfloat16_found = True
             if not bfloat16_found:
                 print("  Verified: All parameters are float32")
+            
+            # Disable any autocast settings in the model
+            if hasattr(sam3_video_predictor.model, 'autocast_enabled'):
+                sam3_video_predictor.model.autocast_enabled = False
+                print("  Disabled autocast in model")
+            
+            # Also check for autocast in submodules
+            for name, module in sam3_video_predictor.model.named_modules():
+                if hasattr(module, 'autocast_enabled'):
+                    module.autocast_enabled = False
 
         SAM3_VIDEO_AVAILABLE = True
         print("✓ SAM 3 video predictor initialized successfully")
