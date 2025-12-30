@@ -3067,24 +3067,74 @@ async def video_add_prompt(request: VideoAddPromptRequest):
                     debug_info["mask_source"] = "no detections"
                     debug_info["detection_error"] = f"SAM3 detected 0 objects with text '{request.text}'."
                     
-                    # Suggest alternative texts based on input
+                    # Suggest alternative texts based on input (generic, not hardcoded)
                     suggestions = []
-                    text_lower = request.text.lower() if request.text else ""
-                    if "candle" in text_lower:
-                        suggestions = ["burning candle", "lit candle", "candle with flame", "candle flame"]
-                    elif "flame" in text_lower:
-                        suggestions = ["burning flame", "fire flame", "candle flame", "bright flame"]
-                    elif "person" in text_lower or "pessoa" in text_lower:
-                        suggestions = ["person", "human", "people", "person walking", "person standing"]
+                    if request.text:
+                        # Generate generic suggestions by adding descriptive words
+                        base_text = request.text.strip()
+                        suggestions = [
+                            f"{base_text} object",
+                            f"bright {base_text}",
+                            f"{base_text} visible",
+                            f"a {base_text}",
+                            f"the {base_text}",
+                        ]
                     else:
-                        suggestions = [f"{request.text} object", f"bright {request.text}", f"{request.text} visible"]
+                        suggestions = ["object", "item", "thing"]
                     
                     debug_info["suggested_texts"] = suggestions
                     debug_info["suggestion"] = f"Try: {', '.join(suggestions[:3])}, or use point/box prompts."
                     print(f"[DEBUG] No objects detected! Text '{request.text}' returned 0 masks. Suggestions: {', '.join(suggestions[:3])}")
+                    
+                    # Try automatic retry with first suggestion if it's different
+                    if suggestions and suggestions[0] != request.text and not used_fallback:
+                        try:
+                            print(f"[DEBUG] Auto-retrying with suggested text: '{suggestions[0]}'")
+                            retry_request = {
+                                "type": "add_prompt",
+                                "session_id": predictor_session_id,
+                                "frame_index": request.frame_index,
+                                "obj_id": request.object_id,
+                                "text": suggestions[0],
+                            }
+                            retry_response = sam3_video_predictor.handle_request(retry_request)
+                            retry_outputs = retry_response.get("outputs", {})
+                            
+                            if isinstance(retry_outputs, dict) and "out_binary_masks" in retry_outputs:
+                                retry_masks = retry_outputs["out_binary_masks"]
+                                retry_obj_ids = retry_outputs.get("out_obj_ids", [])
+                                
+                                if retry_masks.shape[0] > 0 and len(retry_obj_ids) > 0:
+                                    # Success! Use the retry result
+                                    print(f"[DEBUG] Auto-retry successful! Found {retry_masks.shape[0]} objects with '{suggestions[0]}'")
+                                    response = retry_response
+                                    outputs = retry_outputs
+                                    masks_array = retry_masks
+                                    obj_ids = retry_obj_ids.tolist() if isinstance(retry_obj_ids, np.ndarray) else retry_obj_ids
+                                    num_masks = masks_array.shape[0]
+                                    num_obj_ids = len(obj_ids)
+                                    debug_info["auto_retry_used"] = True
+                                    debug_info["auto_retry_text"] = suggestions[0]
+                                    debug_info["original_text"] = request.text
+                                    # Process mask from retry result
+                                    if num_masks > 0:
+                                        mask_np = masks_array[0]
+                                        actual_id = int(obj_ids[0]) if num_obj_ids > 0 else 0
+                                        debug_info["mask_source"] = f"outputs['out_binary_masks'][0] (auto-retry with '{suggestions[0]}')"
+                                        debug_info["actual_object_id"] = actual_id
+                                        debug_info["object_id_found"] = False
+                                        debug_info["requested_object_id"] = request.object_id
+                                        # Update session
+                                        if request.object_id not in session.get("objects", {}):
+                                            session.setdefault("objects", {})[request.object_id] = {}
+                                        session["objects"][request.object_id]["actual_sam3_id"] = actual_id
+                                        session["objects"][request.object_id]["sam3_id_mapping"] = {request.object_id: actual_id}
+                        except Exception as retry_error:
+                            print(f"[DEBUG] Auto-retry failed: {retry_error}")
+                            debug_info["auto_retry_failed"] = str(retry_error)
                 
-                # Find mask for this object_id
-                elif num_obj_ids > 0 and num_masks > 0:
+                # Find mask for this object_id (processes original result if auto-retry didn't work)
+                if mask_np is None and num_obj_ids > 0 and num_masks > 0:
                     # Convert obj_ids to list if numpy array
                     if isinstance(obj_ids, np.ndarray):
                         obj_ids = obj_ids.tolist()
