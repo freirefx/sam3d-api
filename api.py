@@ -3688,19 +3688,12 @@ async def video_get_frame(session_id: str, frame_index: int):
         # Convert BGR to RGB
         frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
         
-        # Encode frame to base64
-        frame_image = Image.fromarray(frame_rgb.astype(np.uint8), mode="RGB")
-        buffer = io.BytesIO()
-        frame_image.save(buffer, format="PNG")
-        buffer.seek(0)
-        frame_b64 = base64.b64encode(buffer.getvalue()).decode("utf-8")
-
         # Get masks for this frame if propagation was done
         frame_masks = {}
         frame_scores = {}
         propagated_masks = session.get("propagated_masks", {})
         propagated_scores = session.get("propagated_scores", {})
-        
+
         frame_idx_str = str(frame_index)
         
         # Also check for ID mapping - user may have requested object_id 1 but SAM3 assigned 0
@@ -3712,9 +3705,12 @@ async def video_get_frame(session_id: str, frame_index: int):
                 id_mapping[str(user_obj_id)] = str(sam3_id)
                 id_mapping[str(sam3_id)] = str(user_obj_id)  # Reverse mapping
         
+        # Collect unique masks (avoid duplicates from ID mapping)
+        unique_masks = {}
         for obj_id, obj_masks in propagated_masks.items():
             if frame_idx_str in obj_masks:
-                # Use both the SAM3 ID and mapped user ID
+                # Use the SAM3 ID as key to avoid duplicates
+                unique_masks[obj_id] = obj_masks[frame_idx_str]
                 frame_masks[obj_id] = obj_masks[frame_idx_str]
                 # Also add with user's requested ID if mapped
                 if obj_id in id_mapping:
@@ -3729,8 +3725,67 @@ async def video_get_frame(session_id: str, frame_index: int):
                     mapped_id = id_mapping[obj_id]
                     frame_scores[mapped_id] = obj_scores[frame_idx_str]
         
+        # Overlay masks on frame
+        if unique_masks:
+            # Define colors for different objects (BGR format for OpenCV, then convert to RGB)
+            colors = [
+                (0, 255, 0),      # Green
+                (255, 0, 0),      # Blue
+                (0, 0, 255),      # Red
+                (255, 255, 0),    # Cyan
+                (255, 0, 255),    # Magenta
+                (0, 255, 255),    # Yellow
+                (128, 0, 128),    # Purple
+                (255, 165, 0),    # Orange
+            ]
+            
+            # Create overlay image with transparency
+            overlay = frame_rgb.copy()
+            
+            for idx, (obj_id, mask_b64) in enumerate(unique_masks.items()):
+                try:
+                    # Decode mask
+                    mask_bytes = base64.b64decode(mask_b64)
+                    mask_img = Image.open(io.BytesIO(mask_bytes)).convert("L")
+                    mask_np = np.array(mask_img)
+                    
+                    # Resize mask if needed
+                    if mask_np.shape != frame_rgb.shape[:2]:
+                        mask_np = cv2.resize(mask_np, (frame_rgb.shape[1], frame_rgb.shape[0]), interpolation=cv2.INTER_NEAREST)
+                    
+                    # Get color for this object
+                    color = colors[idx % len(colors)]
+                    # Convert BGR to RGB for overlay
+                    color_rgb = (color[2], color[1], color[0])
+                    
+                    # Create colored mask
+                    colored_mask = np.zeros_like(frame_rgb)
+                    mask_bool = mask_np > 128  # Threshold mask
+                    colored_mask[mask_bool] = color_rgb
+                    
+                    # Blend with original frame (alpha blending)
+                    alpha = 0.4  # Transparency factor
+                    overlay = np.where(
+                        np.stack([mask_bool] * 3, axis=2),
+                        (1 - alpha) * overlay + alpha * colored_mask,
+                        overlay
+                    ).astype(np.uint8)
+                    
+                except Exception as e:
+                    print(f"[DEBUG] Error overlaying mask for object {obj_id}: {e}")
+                    continue
+            
+            frame_rgb = overlay
+        
         if not frame_masks:
             print(f"[DEBUG] No masks found for frame {frame_index}. Available object IDs: {list(propagated_masks.keys())}, frame keys in first object: {list(list(propagated_masks.values())[0].keys())[:5] if propagated_masks else 'N/A'}")
+
+        # Encode frame to base64 (with masks overlaid if any)
+        frame_image = Image.fromarray(frame_rgb.astype(np.uint8), mode="RGB")
+        buffer = io.BytesIO()
+        frame_image.save(buffer, format="PNG")
+        buffer.seek(0)
+        frame_b64 = base64.b64encode(buffer.getvalue()).decode("utf-8")
 
         return JSONResponse({
             "success": True,
