@@ -2996,12 +2996,14 @@ async def video_add_prompt(request: VideoAddPromptRequest):
                     # Try to use a more descriptive text if we have points (suggest person/persona)
                     fallback_text = request.text
                     if not fallback_text and request.point_coords:
-                        # If user clicked a point but no text, suggest "person" for better detection
+                        # If user clicked a point but no text, use "person" 
+                        # The box will help limit detection to that region
                         fallback_text = "person"
-                        print(f"[DEBUG] No text provided, using 'person' as fallback for point prompt")
+                        print(f"[DEBUG] No text provided, using 'person' with box to limit detection region")
                     
                     fallback_text_used = fallback_text or "object"
-                    # Remove points/boxes and use text instead
+                    # Use text + box together to limit detection to the region around the point
+                    # This helps focus on the specific person/object at the clicked location
                     text_prompt_request = {
                         "type": "add_prompt",
                         "session_id": predictor_session_id,
@@ -3009,7 +3011,11 @@ async def video_add_prompt(request: VideoAddPromptRequest):
                         "obj_id": request.object_id,
                         "text": fallback_text_used,
                     }
-                    print(f"[DEBUG] Retrying with text prompt: {text_prompt_request}")
+                    # Keep the box if we created one from points - this limits detection to that region
+                    if "boxes" in prompt_request:
+                        text_prompt_request["boxes"] = prompt_request["boxes"]
+                        print(f"[DEBUG] Keeping box from points to limit text detection to region: {prompt_request['boxes']}")
+                    print(f"[DEBUG] Retrying with text + box prompt: {text_prompt_request}")
                     response = sam3_video_predictor.handle_request(text_prompt_request)
                 else:
                     raise
@@ -3044,9 +3050,13 @@ async def video_add_prompt(request: VideoAddPromptRequest):
             
             # Add warning if fallback was used
             if used_fallback:
-                result["warning"] = f"Point prompt required cache. Used text prompt '{fallback_text_used}' instead. For better results, use text description (e.g., 'person', 'person with white shirt') or draw a box around the object."
+                if request.point_coords:
+                    result["warning"] = f"Point prompts require cache. Used text '{fallback_text_used}' with box around clicked point. For better accuracy, use a descriptive text prompt (e.g., 'person with white and blue shirt') instead of clicking a point."
+                else:
+                    result["warning"] = f"Used text prompt '{fallback_text_used}'. For better results, use a more descriptive text (e.g., 'person with white shirt')."
                 result["used_fallback"] = True
                 result["fallback_text"] = fallback_text_used
+                result["suggestion"] = "Try using a text description like 'person with white and blue shirt' for more accurate segmentation."
             
             return JSONResponse(result)
         else:
