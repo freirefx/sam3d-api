@@ -3026,19 +3026,56 @@ async def video_add_prompt(request: VideoAddPromptRequest):
                 "prompt_type": "text" if request.text else "points" if request.point_coords else "box" if request.box else "mask",
             }
 
-            # Encode mask to base64
+            # Encode mask to base64 and collect debug info
             mask_b64 = None
+            debug_info = {}
+            
+            # Check what outputs we got
+            outputs = response.get("outputs", {})
+            debug_info["outputs_keys"] = list(outputs.keys()) if isinstance(outputs, dict) else "not a dict"
+            debug_info["response_keys"] = list(response.keys())
+            
+            # Check for masks in outputs
             if "mask" in response and response["mask"] is not None:
                 mask_np = response["mask"]
                 if isinstance(mask_np, torch.Tensor):
                     mask_np = mask_np.cpu().numpy()
                 mask_np = np.squeeze(mask_np)
+                mask_area = np.sum(mask_np > 0) if mask_np.size > 0 else 0
+                debug_info["mask_shape"] = mask_np.shape if mask_np.size > 0 else "empty"
+                debug_info["mask_area_pixels"] = int(mask_area)
+                debug_info["mask_area_percent"] = float(mask_area / (mask_np.size if mask_np.size > 0 else 1) * 100)
+                
                 mask_np = (mask_np > 0).astype(np.uint8) * 255
                 mask_image = Image.fromarray(mask_np, mode="L")
                 buffer = io.BytesIO()
                 mask_image.save(buffer, format="PNG")
                 buffer.seek(0)
                 mask_b64 = base64.b64encode(buffer.getvalue()).decode("utf-8")
+                debug_info["mask_encoded"] = True
+            else:
+                debug_info["mask_found"] = False
+                # Check if masks are in outputs dict
+                if isinstance(outputs, dict):
+                    for key, value in outputs.items():
+                        if "mask" in str(key).lower() or isinstance(value, (torch.Tensor, np.ndarray)):
+                            debug_info[f"output_{key}_type"] = str(type(value))
+                            if isinstance(value, (torch.Tensor, np.ndarray)):
+                                debug_info[f"output_{key}_shape"] = str(value.shape) if hasattr(value, 'shape') else "no shape"
+            
+            # Check for scores and other info
+            if "score" in response:
+                debug_info["score"] = float(response["score"])
+            if "scores" in response:
+                debug_info["scores"] = response["scores"]
+            
+            # Check outputs for object info
+            if isinstance(outputs, dict):
+                num_objects = len([k for k in outputs.keys() if isinstance(k, (int, str)) and str(k).isdigit()])
+                debug_info["num_objects_detected"] = num_objects
+                debug_info["object_ids"] = [k for k in outputs.keys() if isinstance(k, (int, str)) and (str(k).isdigit() or k == request.object_id)]
+            
+            print(f"[DEBUG] add_prompt result - mask_area: {debug_info.get('mask_area_pixels', 0)} pixels ({debug_info.get('mask_area_percent', 0):.2f}%), num_objects: {debug_info.get('num_objects_detected', 0)}")
 
             result = {
                 "success": True,
@@ -3046,6 +3083,7 @@ async def video_add_prompt(request: VideoAddPromptRequest):
                 "frame_index": request.frame_index,
                 "mask": mask_b64,
                 "score": response.get("score", 0.95),
+                "debug": debug_info,  # Add debug info
             }
             
             # Add warning if fallback was used
@@ -3421,6 +3459,108 @@ async def video_get_frame(session_id: str, frame_index: int):
             "total_frames": total_frames,
             "masks": frame_masks if frame_masks else None,
             "scores": frame_scores if frame_scores else None,
+        })
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+
+@app.get("/video/debug-frame/{session_id}/{frame_index}")
+async def video_debug_frame(session_id: str, frame_index: int):
+    """
+    Debug endpoint to see what was detected on a specific frame before propagation.
+    
+    Args:
+        session_id: Session ID from start-session
+        frame_index: Frame index to debug
+        
+    Returns:
+        JSON response with detailed debug information about detections on this frame.
+    """
+    try:
+        if not SAM3_VIDEO_AVAILABLE or sam3_video_predictor is None:
+            return JSONResponse(
+                status_code=503,
+                content={"error": "SAM 3 video predictor not available."},
+            )
+
+        if session_id not in video_sessions:
+            return JSONResponse(
+                status_code=404,
+                content={"error": f"Session {session_id} not found."},
+            )
+
+        session = video_sessions[session_id]
+        predictor_session_id = session.get("predictor_session_id", session_id)
+        
+        # Get frame to see what's in it
+        video_path = session.get("video_path")
+        if not video_path or not os.path.exists(video_path):
+            return JSONResponse(
+                status_code=404,
+                content={"error": "Video file not found."},
+            )
+        
+        cap = cv2.VideoCapture(video_path)
+        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
+        ret, frame_bgr = cap.read()
+        cap.release()
+        
+        if not ret:
+            return JSONResponse(
+                status_code=404,
+                content={"error": f"Frame {frame_index} not found."},
+            )
+        
+        # Get information about objects added to this frame
+        objects_info = {}
+        for obj_id, obj_data in session.get("objects", {}).items():
+            if obj_data.get("frame_index") == frame_index:
+                objects_info[obj_id] = {
+                    "prompt_type": obj_data.get("prompt_type", "unknown"),
+                    "frame_index": obj_data.get("frame_index"),
+                }
+        
+        # Try to get current detections from the predictor
+        debug_info = {
+            "session_id": session_id,
+            "predictor_session_id": predictor_session_id,
+            "frame_index": frame_index,
+            "objects_added": objects_info,
+            "total_objects": len(session.get("objects", {})),
+            "video_path": video_path,
+            "frame_shape": frame_bgr.shape if ret else None,
+        }
+        
+        # Check if propagation was done
+        propagated_masks = session.get("propagated_masks", {})
+        if propagated_masks:
+            frame_idx_str = str(frame_index)
+            masks_for_frame = {}
+            for obj_id, obj_masks in propagated_masks.items():
+                if frame_idx_str in obj_masks:
+                    mask_data = obj_masks[frame_idx_str]
+                    # Calculate mask area
+                    try:
+                        mask_bytes = base64.b64decode(mask_data)
+                        mask_img = Image.open(io.BytesIO(mask_bytes)).convert("L")
+                        mask_np = np.array(mask_img)
+                        mask_area = np.sum(mask_np > 0)
+                        masks_for_frame[obj_id] = {
+                            "has_mask": True,
+                            "mask_area_pixels": int(mask_area),
+                            "mask_area_percent": float(mask_area / mask_np.size * 100) if mask_np.size > 0 else 0,
+                            "mask_shape": mask_np.shape,
+                        }
+                    except Exception as e:
+                        masks_for_frame[obj_id] = {"has_mask": True, "error": str(e)}
+            debug_info["masks_after_propagation"] = masks_for_frame
+        
+        return JSONResponse({
+            "success": True,
+            "debug": debug_info,
         })
 
     except Exception as e:
