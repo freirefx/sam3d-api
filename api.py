@@ -432,20 +432,21 @@ def initialize_sam3_video_predictor():
         print(f"  Calling build_sam3_video_predictor with: {kwargs}")
         sam3_video_predictor = build_sam3_video_predictor(**kwargs)
 
-        # Fix dtype mismatch: convert model to float32 if it's in bfloat16
+        # Fix dtype mismatch: convert ENTIRE model to float32 
         # This prevents "Input type (c10::BFloat16) and bias type (float)" errors
+        print("  Converting video predictor to float32 to avoid BFloat16 errors...")
+        
+        # Convert the entire predictor and all its submodules
         if hasattr(sam3_video_predictor, 'model'):
-            model_obj = sam3_video_predictor.model
-            if hasattr(model_obj, 'float'):
-                print("  Converting video predictor model to float32...")
-                model_obj.float()
-            # Also ensure mask decoder is in float32
-            if hasattr(model_obj, 'sam_mask_decoder'):
-                model_obj.sam_mask_decoder.float()
-                print("  Converted sam_mask_decoder to float32")
-            if hasattr(model_obj, 'tracker_backbone'):
-                model_obj.tracker_backbone.float()
-                print("  Converted tracker_backbone to float32")
+            sam3_video_predictor.model = sam3_video_predictor.model.float()
+            print("  Converted entire model to float32")
+            
+            # Also explicitly convert any submodules that might retain bfloat16
+            for name, module in sam3_video_predictor.model.named_modules():
+                if hasattr(module, 'weight') and module.weight is not None:
+                    if module.weight.dtype == torch.bfloat16:
+                        module.float()
+            print("  Verified all submodules are float32")
 
         SAM3_VIDEO_AVAILABLE = True
         print("✓ SAM 3 video predictor initialized successfully")
@@ -2682,14 +2683,36 @@ async def video_start_session(request: VideoStartSessionRequest):
                 "resource_type": request.resource_type,
             })
 
+            # Get video dimensions - try multiple keys and fallback to reading from video file
+            num_frames = response.get("num_frames", 0)
+            video_height = response.get("video_height", response.get("height", 0))
+            video_width = response.get("video_width", response.get("width", 0))
+            
+            # If dimensions are still 0, try to read from the video file directly
+            if video_height == 0 or video_width == 0:
+                try:
+                    import cv2
+                    cap = cv2.VideoCapture(video_path)
+                    if cap.isOpened():
+                        video_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+                        video_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                        if num_frames == 0:
+                            num_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+                        cap.release()
+                        print(f"  Read video dimensions from file: {video_width}x{video_height}, {num_frames} frames")
+                except Exception as e:
+                    print(f"  Warning: Could not read video dimensions: {e}")
+            
             # Store session info
             video_sessions[session_id] = {
                 "predictor_session_id": response.get("session_id", session_id),
                 "video_path": video_path,
                 "temp_video": temp_video,
-                "num_frames": response.get("num_frames", 0),
-                "video_height": response.get("video_height", 0),
-                "video_width": response.get("video_width", 0),
+                "num_frames": num_frames,
+                "video_height": video_height,
+                "video_width": video_width,
+                "width": video_width,  # Also store as width/height for compatibility
+                "height": video_height,
                 "objects": {},  # Track object IDs and their prompts
                 "created_at": str(np.datetime64("now")),
             }
@@ -2697,9 +2720,9 @@ async def video_start_session(request: VideoStartSessionRequest):
             return JSONResponse({
                 "success": True,
                 "session_id": session_id,
-                "num_frames": response.get("num_frames", 0),
-                "video_height": response.get("video_height", 0),
-                "video_width": response.get("video_width", 0),
+                "num_frames": num_frames,
+                "video_height": video_height,
+                "video_width": video_width,
             })
         else:
             # Fallback: Use direct API if available
