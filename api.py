@@ -432,6 +432,21 @@ def initialize_sam3_video_predictor():
         print(f"  Calling build_sam3_video_predictor with: {kwargs}")
         sam3_video_predictor = build_sam3_video_predictor(**kwargs)
 
+        # Fix dtype mismatch: convert model to float32 if it's in bfloat16
+        # This prevents "Input type (c10::BFloat16) and bias type (float)" errors
+        if hasattr(sam3_video_predictor, 'model'):
+            model_obj = sam3_video_predictor.model
+            if hasattr(model_obj, 'float'):
+                print("  Converting video predictor model to float32...")
+                model_obj.float()
+            # Also ensure mask decoder is in float32
+            if hasattr(model_obj, 'sam_mask_decoder'):
+                model_obj.sam_mask_decoder.float()
+                print("  Converted sam_mask_decoder to float32")
+            if hasattr(model_obj, 'tracker_backbone'):
+                model_obj.tracker_backbone.float()
+                print("  Converted tracker_backbone to float32")
+
         SAM3_VIDEO_AVAILABLE = True
         print("✓ SAM 3 video predictor initialized successfully")
 
@@ -2759,26 +2774,55 @@ async def video_add_prompt(request: VideoAddPromptRequest):
         }
 
         # Add prompt data
-        # SAM3 video predictor requires "text" or "boxes" (plural)
+        # SAM3 video predictor REQUIRES "text" or "boxes" (plural) - points alone don't work!
+        print(f"[DEBUG] add_prompt raw request: text={request.text}, point_coords={request.point_coords}, box={request.box}")
+        
+        # Get frame dimensions from session for box creation
+        width = session.get("width", 1920)
+        height = session.get("height", 1080)
+        
+        has_boxes = False
+        
         if request.text:
             prompt_request["text"] = request.text
-        if request.point_coords:
+        
+        if request.box and len(request.box) == 4:
+            prompt_request["boxes"] = [request.box]
+            has_boxes = True
+            print(f"[DEBUG] Using provided box: {request.box}")
+        
+        if request.point_coords and len(request.point_coords) > 0:
             # Points need to be passed as point_coords and point_labels
             prompt_request["point_coords"] = request.point_coords
             prompt_request["point_labels"] = request.point_labels or [1] * len(request.point_coords)
-            # If only points provided, we need to create a box from points as fallback
-            # because SAM3 video requires text or boxes
-            if not request.text and not request.box:
-                # Create bounding box from points with some padding
+            
+            # SAM3 video REQUIRES text or boxes, so create box from points
+            if not has_boxes and not request.text:
                 points = request.point_coords
-                if len(points) > 0:
-                    xs = [p[0] for p in points]
-                    ys = [p[1] for p in points]
-                    padding = 50  # pixels
-                    box = [min(xs) - padding, min(ys) - padding, max(xs) + padding, max(ys) + padding]
-                    prompt_request["boxes"] = [box]  # boxes is a list of boxes
-        if request.box:
-            prompt_request["boxes"] = [request.box]  # boxes is a list of boxes
+                xs = [p[0] for p in points]
+                ys = [p[1] for p in points]
+                padding = 100  # pixels - larger padding for better detection
+                box = [
+                    max(0, min(xs) - padding), 
+                    max(0, min(ys) - padding), 
+                    min(width, max(xs) + padding), 
+                    min(height, max(ys) + padding)
+                ]
+                prompt_request["boxes"] = [box]
+                has_boxes = True
+                print(f"[DEBUG] Created box from points: {box}")
+        
+        # FALLBACK: If still no boxes and no text, create a default box from frame center
+        # This ensures we ALWAYS have boxes to prevent the assertion error
+        if not has_boxes and not request.text:
+            cx, cy = width // 2, height // 2
+            default_box = [cx - 200, cy - 200, cx + 200, cy + 200]
+            prompt_request["boxes"] = [default_box]
+            has_boxes = True
+            print(f"[DEBUG] Using default center box as fallback: {default_box}")
+        
+        print(f"[DEBUG] Final prompt_request: {prompt_request}")
+        
         if request.mask:
             try:
                 mask_data = base64.b64decode(request.mask)
