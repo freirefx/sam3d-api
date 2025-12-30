@@ -2931,6 +2931,27 @@ async def video_add_prompt(request: VideoAddPromptRequest):
             prompt_request["point_labels"] = labels_tensor
             has_prompt = True
             print(f"[DEBUG] Using relative points: {rel_points}")
+            
+            # Create a box from points to help with detection (SAM3 works better with box + points)
+            # Use larger padding for better object detection (especially for people)
+            points = request.point_coords
+            xs = [p[0] for p in points]
+            ys = [p[1] for p in points]
+            # Use adaptive padding: larger for better person detection
+            # People are typically taller than wide, so use more vertical padding
+            padding_x = max(200, width * 0.20)  # At least 200px or 20% of width
+            padding_y = max(250, height * 0.25)  # At least 250px or 25% of height (more for people)
+            
+            box = [
+                max(0, min(xs) - padding_x), 
+                max(0, min(ys) - padding_y), 
+                min(width, max(xs) + padding_x), 
+                min(height, max(ys) + padding_y)
+            ]
+            rel_box = [box[0] / width, box[1] / height, box[2] / width, box[3] / height]
+            boxes_tensor = torch.tensor([rel_box], dtype=torch.float32, device=device)
+            prompt_request["boxes"] = boxes_tensor
+            print(f"[DEBUG] Created box from points with padding: {box} (relative: {rel_box})")
         
         # BOX PROMPT - convert to relative coordinates
         if request.box and len(request.box) == 4:
@@ -2962,6 +2983,8 @@ async def video_add_prompt(request: VideoAddPromptRequest):
                 )
 
         # Call predictor
+        used_fallback = False
+        fallback_text_used = None
         if hasattr(sam3_video_predictor, 'handle_request'):
             try:
                 response = sam3_video_predictor.handle_request(prompt_request)
@@ -2969,13 +2992,22 @@ async def video_add_prompt(request: VideoAddPromptRequest):
                 # Handle "No cached outputs found" error by falling back to text prompt
                 if "cached outputs" in str(ae).lower() or "propagation" in str(ae).lower():
                     print(f"[DEBUG] Cache error, falling back to text prompt: {ae}")
+                    used_fallback = True
+                    # Try to use a more descriptive text if we have points (suggest person/persona)
+                    fallback_text = request.text
+                    if not fallback_text and request.point_coords:
+                        # If user clicked a point but no text, suggest "person" for better detection
+                        fallback_text = "person"
+                        print(f"[DEBUG] No text provided, using 'person' as fallback for point prompt")
+                    
+                    fallback_text_used = fallback_text or "object"
                     # Remove points/boxes and use text instead
                     text_prompt_request = {
                         "type": "add_prompt",
                         "session_id": predictor_session_id,
                         "frame_index": request.frame_index,
                         "obj_id": request.object_id,
-                        "text": request.text or "object",  # Use provided text or default
+                        "text": fallback_text_used,
                     }
                     print(f"[DEBUG] Retrying with text prompt: {text_prompt_request}")
                     response = sam3_video_predictor.handle_request(text_prompt_request)
@@ -3002,13 +3034,21 @@ async def video_add_prompt(request: VideoAddPromptRequest):
                 buffer.seek(0)
                 mask_b64 = base64.b64encode(buffer.getvalue()).decode("utf-8")
 
-            return JSONResponse({
+            result = {
                 "success": True,
                 "object_id": request.object_id,
                 "frame_index": request.frame_index,
                 "mask": mask_b64,
                 "score": response.get("score", 0.95),
-            })
+            }
+            
+            # Add warning if fallback was used
+            if used_fallback:
+                result["warning"] = f"Point prompt required cache. Used text prompt '{fallback_text_used}' instead. For better results, use text description (e.g., 'person', 'person with white shirt') or draw a box around the object."
+                result["used_fallback"] = True
+                result["fallback_text"] = fallback_text_used
+            
+            return JSONResponse(result)
         else:
             return JSONResponse(
                 status_code=501,
