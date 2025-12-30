@@ -2765,63 +2765,75 @@ async def video_add_prompt(request: VideoAddPromptRequest):
         session = video_sessions[request.session_id]
         predictor_session_id = session.get("predictor_session_id", request.session_id)
 
-        # Build prompt request
+        # Build prompt request - SAM3 video predictor uses specific parameter names:
+        # - "obj_id" not "object_id"
+        # - "points" not "point_coords" (as torch tensor)
+        # - "text" for text prompts
+        # - "boxes" for box prompts (as torch tensor)
         prompt_request = {
             "type": "add_prompt",
             "session_id": predictor_session_id,
             "frame_index": request.frame_index,
-            "object_id": request.object_id,
+            "obj_id": request.object_id,  # SAM3 uses obj_id
         }
 
         # Add prompt data
-        # SAM3 video predictor REQUIRES "text" or "boxes" (plural) - points alone don't work!
         print(f"[DEBUG] add_prompt raw request: text={request.text}, point_coords={request.point_coords}, box={request.box}")
         
         # Get frame dimensions from session for box creation
         width = session.get("width", 1920)
         height = session.get("height", 1080)
         
-        has_boxes = False
+        has_prompt = False
         
         if request.text:
             prompt_request["text"] = request.text
+            has_prompt = True
+            print(f"[DEBUG] Using text prompt: {request.text}")
         
         if request.box and len(request.box) == 4:
-            prompt_request["boxes"] = [request.box]
-            has_boxes = True
-            print(f"[DEBUG] Using provided box: {request.box}")
+            # Convert to torch tensor - SAM3 expects tensor
+            boxes_tensor = torch.tensor([request.box], dtype=torch.float32, device=device)
+            prompt_request["boxes"] = boxes_tensor
+            has_prompt = True
+            print(f"[DEBUG] Using provided box as tensor: {request.box}")
         
         if request.point_coords and len(request.point_coords) > 0:
-            # Points need to be passed as point_coords and point_labels
-            prompt_request["point_coords"] = request.point_coords
-            prompt_request["point_labels"] = request.point_labels or [1] * len(request.point_coords)
+            # Convert points to torch tensors - SAM3 uses "points" not "point_coords"
+            points_tensor = torch.tensor(request.point_coords, dtype=torch.float32, device=device)
+            labels_list = request.point_labels or [1] * len(request.point_coords)
+            labels_tensor = torch.tensor(labels_list, dtype=torch.int32, device=device)
             
-            # SAM3 video REQUIRES text or boxes, so create box from points
-            if not has_boxes and not request.text:
+            prompt_request["points"] = points_tensor
+            prompt_request["point_labels"] = labels_tensor
+            has_prompt = True
+            print(f"[DEBUG] Using points tensor: {points_tensor.shape}")
+            
+            # SAM3 video also needs boxes when using points, create from points
+            if "boxes" not in prompt_request and not request.text:
                 points = request.point_coords
                 xs = [p[0] for p in points]
                 ys = [p[1] for p in points]
-                padding = 100  # pixels - larger padding for better detection
+                padding = 100
                 box = [
                     max(0, min(xs) - padding), 
                     max(0, min(ys) - padding), 
                     min(width, max(xs) + padding), 
                     min(height, max(ys) + padding)
                 ]
-                prompt_request["boxes"] = [box]
-                has_boxes = True
-                print(f"[DEBUG] Created box from points: {box}")
+                boxes_tensor = torch.tensor([box], dtype=torch.float32, device=device)
+                prompt_request["boxes"] = boxes_tensor
+                print(f"[DEBUG] Created box tensor from points: {box}")
         
-        # FALLBACK: If still no boxes and no text, create a default box from frame center
-        # This ensures we ALWAYS have boxes to prevent the assertion error
-        if not has_boxes and not request.text:
+        # FALLBACK: If still no prompt, create a default box from frame center
+        if not has_prompt:
             cx, cy = width // 2, height // 2
             default_box = [cx - 200, cy - 200, cx + 200, cy + 200]
-            prompt_request["boxes"] = [default_box]
-            has_boxes = True
-            print(f"[DEBUG] Using default center box as fallback: {default_box}")
+            boxes_tensor = torch.tensor([default_box], dtype=torch.float32, device=device)
+            prompt_request["boxes"] = boxes_tensor
+            print(f"[DEBUG] Using default center box tensor as fallback: {default_box}")
         
-        print(f"[DEBUG] Final prompt_request: {prompt_request}")
+        print(f"[DEBUG] Final prompt_request keys: {list(prompt_request.keys())}")
         
         if request.mask:
             try:
