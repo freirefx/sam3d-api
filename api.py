@@ -3058,8 +3058,33 @@ async def video_add_prompt(request: VideoAddPromptRequest):
                 masks_array = outputs["out_binary_masks"]  # Shape: (N, H, W)
                 obj_ids = outputs.get("out_obj_ids", [])  # Shape: (N,)
                 
+                # Check if arrays are empty (shape[0] == 0 means no detections)
+                num_masks = masks_array.shape[0] if hasattr(masks_array, 'shape') and len(masks_array.shape) > 0 else 0
+                num_obj_ids = len(obj_ids) if isinstance(obj_ids, (list, np.ndarray)) else 0
+                
+                if num_masks == 0:
+                    debug_info["mask_found"] = False
+                    debug_info["mask_source"] = "no detections"
+                    debug_info["detection_error"] = f"SAM3 detected 0 objects with text '{request.text}'."
+                    
+                    # Suggest alternative texts based on input
+                    suggestions = []
+                    text_lower = request.text.lower() if request.text else ""
+                    if "candle" in text_lower:
+                        suggestions = ["burning candle", "lit candle", "candle with flame", "candle flame"]
+                    elif "flame" in text_lower:
+                        suggestions = ["burning flame", "fire flame", "candle flame", "bright flame"]
+                    elif "person" in text_lower or "pessoa" in text_lower:
+                        suggestions = ["person", "human", "people", "person walking", "person standing"]
+                    else:
+                        suggestions = [f"{request.text} object", f"bright {request.text}", f"{request.text} visible"]
+                    
+                    debug_info["suggested_texts"] = suggestions
+                    debug_info["suggestion"] = f"Try: {', '.join(suggestions[:3])}, or use point/box prompts."
+                    print(f"[DEBUG] No objects detected! Text '{request.text}' returned 0 masks. Suggestions: {', '.join(suggestions[:3])}")
+                
                 # Find mask for this object_id
-                if len(obj_ids) > 0 and len(masks_array) > 0:
+                elif num_obj_ids > 0 and num_masks > 0:
                     # Convert obj_ids to list if numpy array
                     if isinstance(obj_ids, np.ndarray):
                         obj_ids = obj_ids.tolist()
@@ -3081,9 +3106,9 @@ async def video_add_prompt(request: VideoAddPromptRequest):
                         else:
                             # If object_id not found, use first mask (SAM3 assigns its own IDs)
                             # This is normal - SAM3 assigns sequential IDs starting from 0
-                            if len(masks_array) > 0:
+                            if num_masks > 0:
                                 mask_np = masks_array[0]
-                                actual_id = int(obj_ids[0]) if len(obj_ids) > 0 else 0
+                                actual_id = int(obj_ids[0]) if num_obj_ids > 0 else 0
                                 debug_info["mask_source"] = f"outputs['out_binary_masks'][0]"
                                 debug_info["object_id_found"] = False
                                 debug_info["requested_object_id"] = request.object_id
@@ -3100,7 +3125,10 @@ async def video_add_prompt(request: VideoAddPromptRequest):
                         print(f"[DEBUG] Error finding mask for object_id {request.object_id}: {e}")
                         debug_info["object_id_error"] = str(e)
                 else:
-                    debug_info["mask_source"] = "out_binary_masks empty or out_obj_ids empty"
+                    if num_masks == 0:
+                        debug_info["mask_source"] = "out_binary_masks empty (0 detections)"
+                    else:
+                        debug_info["mask_source"] = "out_obj_ids empty"
             # Fallback: try outputs[object_id] format
             elif isinstance(outputs, dict):
                 obj_id_str = str(request.object_id)
