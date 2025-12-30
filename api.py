@@ -2707,10 +2707,20 @@ def cleanup_video_session(session_id: str):
             del session["inference_state"]
         if "video_path" in session and session.get("temp_video", False):
             try:
-                if os.path.exists(session["video_path"]):
-                    os.unlink(session["video_path"])
-            except:
-                pass
+                video_path = session["video_path"]
+                if os.path.exists(video_path):
+                    os.unlink(video_path)
+                # Also clean up resized version if it exists
+                if "_resized" in video_path:
+                    # Original might still exist
+                    original_path = video_path.replace("_resized", "")
+                    if os.path.exists(original_path):
+                        try:
+                            os.unlink(original_path)
+                        except:
+                            pass
+            except Exception as e:
+                print(f"[Video] Warning: Could not delete temp video file: {e}")
         del video_sessions[session_id]
         print(f"[Video] Session {session_id} cleaned up")
 
@@ -2719,6 +2729,7 @@ class VideoStartSessionRequest(BaseModel):
     video: Optional[str] = None  # base64 encoded video (optional)
     video_path: Optional[str] = None  # Path to video file on server
     resource_type: str = "video"  # Type of resource
+    max_resolution: Optional[int] = 720  # Max height/width to resize video (default: 720p) to reduce memory usage
 
 
 @app.post("/video/start-session")
@@ -2749,6 +2760,11 @@ async def video_start_session(request: VideoStartSessionRequest):
                 },
             )
 
+        # Clear GPU cache before loading video to free memory
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            print(f"[Video] GPU cache cleared. Free memory: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.2f} GB total")
+
         # Handle video input
         video_path = None
         temp_video = False
@@ -2775,6 +2791,69 @@ async def video_start_session(request: VideoStartSessionRequest):
             return JSONResponse(
                 status_code=400, content={"error": "Either 'video' or 'video_path' must be provided"}
             )
+
+        # Resize video if needed to reduce memory usage
+        max_res = request.max_resolution or 720
+        if max_res > 0:
+            try:
+                import cv2
+                cap = cv2.VideoCapture(video_path)
+                if cap.isOpened():
+                    original_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+                    original_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                    num_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+                    fps = cap.get(cv2.CAP_PROP_FPS)
+                    
+                    # Check if resizing is needed
+                    max_dim = max(original_width, original_height)
+                    if max_dim > max_res:
+                        print(f"[Video] Resizing video from {original_width}x{original_height} to max {max_res}px to reduce memory usage")
+                        
+                        # Calculate new dimensions maintaining aspect ratio
+                        if original_width > original_height:
+                            new_width = max_res
+                            new_height = int(original_height * (max_res / original_width))
+                        else:
+                            new_height = max_res
+                            new_width = int(original_width * (max_res / original_height))
+                        
+                        # Create resized video file
+                        resized_path = video_path.replace('.mp4', '_resized.mp4')
+                        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+                        out = cv2.VideoWriter(resized_path, fourcc, fps, (new_width, new_height))
+                        
+                        frame_count = 0
+                        while True:
+                            ret, frame = cap.read()
+                            if not ret:
+                                break
+                            resized_frame = cv2.resize(frame, (new_width, new_height), interpolation=cv2.INTER_AREA)
+                            out.write(resized_frame)
+                            frame_count += 1
+                            if frame_count % 100 == 0:
+                                print(f"  Resized {frame_count}/{num_frames} frames...")
+                        
+                        cap.release()
+                        out.release()
+                        
+                        # Always use resized version (it's a new temp file)
+                        # Clean up original if it was temp
+                        if temp_video:
+                            try:
+                                os.unlink(video_path)
+                            except:
+                                pass
+                        
+                        # Use resized video as the new video path
+                        video_path = resized_path
+                        temp_video = True  # Resized video is always temp
+                        
+                        print(f"[Video] Video resized to {new_width}x{new_height}")
+                    else:
+                        cap.release()
+                        print(f"[Video] Video dimensions {original_width}x{original_height} are within limit ({max_res}px)")
+            except Exception as e:
+                print(f"[Video] Warning: Could not resize video: {e}. Proceeding with original video.")
 
         # Create session ID
         session_id = str(uuid.uuid4())
