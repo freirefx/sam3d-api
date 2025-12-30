@@ -447,22 +447,61 @@ def initialize_sam3_video_predictor():
         # This prevents "Input type (c10::BFloat16) and bias type (float)" errors
         print("  Converting video predictor to float32 to avoid BFloat16 errors...")
         
-        def convert_to_float32(module):
-            """Recursively convert all parameters and buffers to float32"""
-            for name, param in module.named_parameters(recurse=False):
+        def convert_model_to_float32(model):
+            """Convert model and all submodules to float32 using .to() method"""
+            # Convert using .to() which is more explicit and reliable
+            model = model.to(dtype=torch.float32)
+            
+            # Also convert all parameters explicitly
+            for param in model.parameters():
                 if param is not None:
-                    param.data = param.data.float()
-            for name, buffer in module.named_buffers(recurse=False):
-                if buffer is not None and buffer.dtype in (torch.bfloat16, torch.float16):
-                    buffer.data = buffer.data.float()
+                    param.data = param.data.to(dtype=torch.float32)
+            
+            # Convert all buffers (including batch norm running stats, etc.)
+            for buffer in model.buffers():
+                if buffer is not None:
+                    buffer.data = buffer.data.to(dtype=torch.float32)
+            
+            return model
+        
+        def register_float32_hooks(model):
+            """Register hooks to convert inputs/outputs to float32"""
+            def convert_input_hook(module, input):
+                if isinstance(input, tuple):
+                    return tuple(x.to(dtype=torch.float32) if isinstance(x, torch.Tensor) and x.dtype != torch.float32 else x for x in input)
+                elif isinstance(input, torch.Tensor):
+                    return input.to(dtype=torch.float32) if input.dtype != torch.float32 else input
+                return input
+            
+            def convert_output_hook(module, input, output):
+                if isinstance(output, torch.Tensor):
+                    return output.to(dtype=torch.float32) if output.dtype != torch.float32 else output
+                elif isinstance(output, dict):
+                    return {k: v.to(dtype=torch.float32) if isinstance(v, torch.Tensor) and v.dtype != torch.float32 else v 
+                           for k, v in output.items()}
+                elif isinstance(output, tuple):
+                    return tuple(x.to(dtype=torch.float32) if isinstance(x, torch.Tensor) and x.dtype != torch.float32 else x for x in output)
+                return output
+            
+            # Register hooks on critical modules (decoder, backbone, etc.)
+            hooks = []
+            for name, module in model.named_modules():
+                if any(keyword in name.lower() for keyword in ['decoder', 'backbone', 'conv', 'linear', 'norm']):
+                    hook1 = module.register_forward_pre_hook(convert_input_hook)
+                    hook2 = module.register_forward_hook(convert_output_hook)
+                    hooks.extend([hook1, hook2])
+            
+            return hooks
         
         # Convert the entire predictor and all its submodules
         if hasattr(sam3_video_predictor, 'model'):
-            # Convert all parameters and buffers recursively
-            sam3_video_predictor.model.apply(convert_to_float32)
-            # Also call .float() on the model itself
-            sam3_video_predictor.model = sam3_video_predictor.model.float()
-            print("  Converted entire model to float32 (parameters + buffers)")
+            # Use robust conversion function
+            sam3_video_predictor.model = convert_model_to_float32(sam3_video_predictor.model)
+            print("  Converted entire model to float32 using .to(dtype=torch.float32)")
+            
+            # Register forward hooks to convert tensors during inference
+            hooks = register_float32_hooks(sam3_video_predictor.model)
+            print(f"  Registered {len(hooks)} forward hooks to ensure float32 during inference")
             
             # Verify conversion
             bfloat16_found = False
@@ -470,8 +509,29 @@ def initialize_sam3_video_predictor():
                 if param.dtype == torch.bfloat16:
                     print(f"  WARNING: Parameter {name} still in bfloat16!")
                     bfloat16_found = True
+            
+            # Check buffers too
+            for name, buffer in sam3_video_predictor.model.named_buffers():
+                if buffer.dtype == torch.bfloat16:
+                    print(f"  WARNING: Buffer {name} still in bfloat16!")
+                    bfloat16_found = True
+            
             if not bfloat16_found:
-                print("  Verified: All parameters are float32")
+                print("  Verified: All parameters and buffers are float32")
+            
+            # Check for autocast in SAM3 code
+            try:
+                import inspect
+                if hasattr(sam3_video_predictor.model, '__class__'):
+                    try:
+                        source = inspect.getsource(sam3_video_predictor.model.__class__)
+                        if 'autocast' in source or 'bfloat16' in source:
+                            print("  WARNING: Model may use autocast internally")
+                    except (OSError, TypeError):
+                        # Source not available (compiled/C extension)
+                        pass
+            except Exception:
+                pass
             
             # Disable any autocast settings in the model
             if hasattr(sam3_video_predictor.model, 'autocast_enabled'):
@@ -2968,6 +3028,26 @@ def run_propagation_sync(task_id: str, session_id: str, predictor_session_id: st
     try:
         propagation_tasks[task_id]["status"] = "processing"
         propagation_tasks[task_id]["progress"] = 0
+        
+        # Verify model is in float32 before propagation
+        if hasattr(sam3_video_predictor, 'model') and sam3_video_predictor.model is not None:
+            bfloat16_found = False
+            for name, param in sam3_video_predictor.model.named_parameters():
+                if param.dtype == torch.bfloat16:
+                    print(f"[WARNING] Parameter {name} is in bfloat16 before propagation! Converting...")
+                    param.data = param.data.to(dtype=torch.float32)
+                    bfloat16_found = True
+            
+            for name, buffer in sam3_video_predictor.model.named_buffers():
+                if buffer.dtype == torch.bfloat16:
+                    print(f"[WARNING] Buffer {name} is in bfloat16 before propagation! Converting...")
+                    buffer.data = buffer.data.to(dtype=torch.float32)
+                    bfloat16_found = True
+            
+            if bfloat16_found:
+                print("[WARNING] Found bfloat16 tensors before propagation - converted to float32")
+            else:
+                print("[DEBUG] Verified: Model is in float32 before propagation")
         
         propagate_request = {
             "type": "propagate_in_video",
