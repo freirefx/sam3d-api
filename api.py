@@ -3035,12 +3035,75 @@ async def video_add_prompt(request: VideoAddPromptRequest):
             debug_info["outputs_keys"] = list(outputs.keys()) if isinstance(outputs, dict) else "not a dict"
             debug_info["response_keys"] = list(response.keys())
             
-            # Check for masks in outputs
+            # Log full response structure for debugging
+            print(f"[DEBUG] Full response keys: {list(response.keys())}")
+            print(f"[DEBUG] Outputs type: {type(outputs)}, keys: {list(outputs.keys()) if isinstance(outputs, dict) else 'N/A'}")
+            if isinstance(outputs, dict):
+                for key, value in outputs.items():
+                    print(f"[DEBUG]   outputs[{key}]: type={type(value)}, shape={getattr(value, 'shape', 'N/A') if hasattr(value, 'shape') else 'N/A'}")
+                    if isinstance(value, dict):
+                        print(f"[DEBUG]     dict keys: {list(value.keys())}")
+            
+            # Check for masks - SAM3 video returns masks in outputs[object_id]
+            mask_np = None
+            
+            # First try response["mask"]
             if "mask" in response and response["mask"] is not None:
                 mask_np = response["mask"]
+                debug_info["mask_source"] = "response['mask']"
+            # Then try outputs[object_id] - this is where SAM3 video typically stores masks
+            elif isinstance(outputs, dict):
+                obj_id_str = str(request.object_id)
+                # Try object_id as key
+                if obj_id_str in outputs:
+                    obj_output = outputs[obj_id_str]
+                    if isinstance(obj_output, dict):
+                        mask_np = obj_output.get("mask", obj_output.get("video_res_mask"))
+                    elif isinstance(obj_output, (torch.Tensor, np.ndarray)):
+                        mask_np = obj_output
+                    debug_info["mask_source"] = f"outputs[{obj_id_str}]"
+                # Try integer key
+                elif request.object_id in outputs:
+                    obj_output = outputs[request.object_id]
+                    if isinstance(obj_output, dict):
+                        mask_np = obj_output.get("mask", obj_output.get("video_res_mask"))
+                    elif isinstance(obj_output, (torch.Tensor, np.ndarray)):
+                        mask_np = obj_output
+                    debug_info["mask_source"] = f"outputs[{request.object_id}]"
+                # Check all outputs for masks
+                else:
+                    for key, value in outputs.items():
+                        if key == request.object_id or str(key) == str(request.object_id):
+                            if isinstance(value, dict):
+                                mask_np = value.get("mask", value.get("video_res_mask"))
+                            elif isinstance(value, (torch.Tensor, np.ndarray)):
+                                mask_np = value
+                            debug_info["mask_source"] = f"outputs[{key}]"
+                            break
+                        # Also check if value itself is a mask
+                        if isinstance(value, (torch.Tensor, np.ndarray)) and len(value.shape) >= 2:
+                            # Could be a mask, check if it's 2D or 3D with single channel
+                            if value.ndim == 2 or (value.ndim == 3 and value.shape[0] == 1):
+                                mask_np = value
+                                debug_info["mask_source"] = f"outputs[{key}] (auto-detected)"
+                                break
+            
+            # Process mask if found
+            if mask_np is not None:
                 if isinstance(mask_np, torch.Tensor):
                     mask_np = mask_np.cpu().numpy()
                 mask_np = np.squeeze(mask_np)
+                
+                # Ensure 2D
+                while mask_np.ndim > 2:
+                    if mask_np.shape[0] == 1:
+                        mask_np = mask_np[0]
+                    elif mask_np.shape[-1] == 1:
+                        mask_np = mask_np[..., 0]
+                    else:
+                        mask_np = mask_np[0]
+                        break
+                
                 mask_area = np.sum(mask_np > 0) if mask_np.size > 0 else 0
                 debug_info["mask_shape"] = mask_np.shape if mask_np.size > 0 else "empty"
                 debug_info["mask_area_pixels"] = int(mask_area)
@@ -3055,13 +3118,16 @@ async def video_add_prompt(request: VideoAddPromptRequest):
                 debug_info["mask_encoded"] = True
             else:
                 debug_info["mask_found"] = False
-                # Check if masks are in outputs dict
+                debug_info["mask_source"] = "not found"
+                # Log all outputs for debugging
                 if isinstance(outputs, dict):
+                    debug_info["all_output_keys"] = list(outputs.keys())
                     for key, value in outputs.items():
-                        if "mask" in str(key).lower() or isinstance(value, (torch.Tensor, np.ndarray)):
-                            debug_info[f"output_{key}_type"] = str(type(value))
-                            if isinstance(value, (torch.Tensor, np.ndarray)):
-                                debug_info[f"output_{key}_shape"] = str(value.shape) if hasattr(value, 'shape') else "no shape"
+                        debug_info[f"output_{key}_type"] = str(type(value))
+                        if isinstance(value, (torch.Tensor, np.ndarray)):
+                            debug_info[f"output_{key}_shape"] = str(value.shape) if hasattr(value, 'shape') else "no shape"
+                        elif isinstance(value, dict):
+                            debug_info[f"output_{key}_dict_keys"] = list(value.keys())
             
             # Check for scores and other info
             if "score" in response:
